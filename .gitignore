@@ -1,0 +1,23 @@
+# Never commit these
+watchlist.json
+run.bat
+.env
+*.env
+secrets.toml
+
+# Streamlit local secrets (use Streamlit Cloud secrets panel instead)
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

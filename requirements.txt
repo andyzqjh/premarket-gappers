@@ -1,0 +1,6 @@
+streamlit>=1.32.0
+tradingview-screener>=0.3.0
+finvizfinance>=0.14.0
+yfinance>=0.2.40
+pandas>=2.0.0
+anthropic>=0.25.0
