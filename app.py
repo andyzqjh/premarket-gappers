@@ -1370,7 +1370,8 @@ NON-NEGOTIABLE:
             "rerating":                   str(parsed.get("rerating", "")).strip(),
             "rerating_reason":            str(parsed.get("rerating_reason", "")).strip(),
         }
-    except Exception:
+    except Exception as e:
+        st.session_state["llm_last_error"] = f"{ticker}: {type(e).__name__}: {e}"
         return {}
 
 
@@ -2538,6 +2539,9 @@ def main() -> None:
             f"request issue.\n\nDetails: {scan_error}"
         )
         return
+
+    if "llm_last_error" in st.session_state and st.session_state["llm_last_error"]:
+        st.warning(f"⚠️ AI analysis error (last ticker): {st.session_state['llm_last_error']}")
 
     auto_added = sync_auto_watchlist(enriched)
     watchlist_items = load_watchlist()
