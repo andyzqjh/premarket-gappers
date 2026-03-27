@@ -1223,8 +1223,6 @@ def llm_catalyst_analysis(
         except Exception:
             pass
     if not api_key:
-        api_key = "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"
-    if not api_key:
         return {}
 
     try:
