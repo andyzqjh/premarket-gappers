@@ -1218,7 +1218,12 @@ def llm_catalyst_analysis(
     """
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
-        return {}
+        try:
+            api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            pass
+    if not api_key:
+        api_key = "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"
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
