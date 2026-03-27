@@ -1,23 +1,16 @@
-# Never commit these
-watchlist.json
-run.bat
+# Secrets — never commit these
 .env
 *.env
-secrets.toml
-
-# Streamlit local secrets (use Streamlit Cloud secrets panel instead)
 .streamlit/secrets.toml
+run.bat
 
-# Python
+# App data
+watchlist.json
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-.Python
-*.egg-info/
-dist/
-build/
+.pytest_cache/
 
 # OS
 .DS_Store
 Thumbs.db
-desktop.ini
