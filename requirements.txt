@@ -1,6 +1,12 @@
-streamlit>=1.35.0
-tradingview-screener>=0.3.0
-finvizfinance>=0.14.0
-yfinance>=0.2.40
+# Pre-Market Gappers Screener — Dependencies
+# Install with:
+#   pip install -r requirements.txt
+#   pip install "finvizfinance @ git+https://github.com/lit26/finvizfinance.git"
+
+flask>=3.0.0
 pandas>=2.0.0
-anthropic>=0.25.0
+tradingview-screener>=0.6.0
+google-genai>=1.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+yfinance>=0.2.54

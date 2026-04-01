@@ -1,1623 +1,571 @@
 """
-Premarket Gappers + All-Time Volume Breaker Watchlist
+How to run: `cd traderwillhu_flask_gapper`, install the packages from the header below, set `GEMINI_API_KEY`, then run `flask --app app run --debug` and open `http://127.0.0.1:5000`.
 
-Install:
-    pip install streamlit tradingview-screener finvizfinance yfinance pandas anthropic
+AI Premarket Gappers Screener (Flask + TradingView + Multi-Source News + Gemini + ib_chart)
 
-Run:
-    streamlit run app.py
+1. Get a free Gemini API key:
+   - Create a free Google AI Studio key at https://aistudio.google.com/app/apikey
+   - PowerShell:
+       $env:GEMINI_API_KEY="your_api_key_here"
+
+2. Install Python packages:
+   - Recommended:
+       pip install -U flask pandas tradingview-screener google-genai yfinance
+       pip install -U "finvizfinance @ git+https://github.com/lit26/finvizfinance.git"
+
+3. Optional TradingView cookies:
+   - If TradingView blocks scanner requests in your region, export your cookies JSON:
+       $env:TRADINGVIEW_COOKIES_JSON='[{"name":"sessionid","value":"...","domain":".tradingview.com","path":"/"}]'
+
+4. Run the Flask app:
+   - PowerShell:
+       cd traderwillhu_flask_gapper
+       flask --app app run --debug
+
+5. Run ib_chart in a separate terminal:
+   - git clone https://github.com/willhjw/ib_chart.git
+   - cd ib_chart
+   - pip install -r requirements.txt
+   - python ib_server.py
+   - Multi-chart links will open at:
+       http://127.0.0.1:5001/ib_multichart.html?symbols=AAPL,MSFT,NVDA&tf=D
 """
 
 from __future__ import annotations
 
-import html
 import json
+import math
 import os
 import re
+import threading
+import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-import anthropic
 import pandas as pd
-import streamlit as st
-import streamlit.components.v1 as components
+import requests
 import yfinance as yf
 from finvizfinance.quote import finvizfinance
-from tradingview_screener import And, Column, Or, Query
+from flask import Flask, jsonify, render_template_string, request
+from google import genai
+from dotenv import load_dotenv
+from tradingview_screener import And, Column, Query
+
+APP_DIR = Path(__file__).resolve().parent
+WORKSPACE_ENV_PATH = APP_DIR.parent / ".env"
+PROJECT_ENV_PATH = APP_DIR / ".env"
+
+load_dotenv(WORKSPACE_ENV_PATH, override=False)
+load_dotenv(PROJECT_ENV_PATH, override=True)
 
 
-APP_TITLE = "Premarket Gappers + All-Time Volume Breaker Watchlist"
-APP_SUBTITLE = (
-    "Dark premarket dashboard for US stocks with catalyst headlines, trend grading, "
-    "volume-breaker detection, and a persistent local watchlist."
+APP_TITLE = "AI Premarket Gappers"
+APP_SUBTITLE = "TradingView premarket gappers + merged Yahoo/Finviz news + AI catalyst grading"
+SCAN_LIMIT = int(os.getenv("SCAN_LIMIT", "18"))
+MIN_PREMARKET_PCT = float(os.getenv("MIN_PREMARKET_PCT", "5"))
+MIN_PREMARKET_VOLUME = int(os.getenv("MIN_PREMARKET_VOLUME", "200000"))
+MIN_PRICE = float(os.getenv("MIN_PRICE", "1"))
+MAX_PRICE = float(os.getenv("MAX_PRICE", "9999"))   # no meaningful price cap for large-caps
+MIN_MARKET_CAP = float(os.getenv("MIN_MARKET_CAP", "2_000_000_000"))   # $2B+
+AUTO_REFRESH_SECONDS = int(os.getenv("AUTO_REFRESH_SECONDS", "60"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))    # throttle to avoid Gemini 429s
+ANALYSIS_CACHE_TTL_SECONDS = int(os.getenv("ANALYSIS_CACHE_TTL_SECONDS", "900"))
+NEWS_CACHE_TTL_SECONDS = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "300"))
+OPENROUTER_TIMEOUT_SECONDS = int(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "90"))
+OPENROUTER_MAX_CONCURRENCY = int(os.getenv("OPENROUTER_MAX_CONCURRENCY", "1"))
+AI_PROMPT_VERSION = os.getenv("AI_PROMPT_VERSION", "2026-04-01-date-aware")
+AI_SYSTEM_MESSAGE = (
+    "You are an elite US stock catalyst analyst for active day traders. "
+    "Return only valid JSON. Never infer stale or future timing without checking the supplied dates and timing notes."
 )
-WATCHLIST_PATH = Path(__file__).with_name("watchlist.json")
-NEW_YORK_TZ = ZoneInfo("America/New_York")
-AUTO_REFRESH_SECONDS = 60
-DEFAULT_SCAN_LIMIT = 30
-MAX_SCAN_LIMIT = 60
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+GEMINI_MODEL_CANDIDATES = [
+    model.strip()
+    for model in os.getenv("GEMINI_MODEL_CANDIDATES", f"{GEMINI_MODEL},gemini-2.5-flash-lite").split(",")
+    if model.strip()
+]
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+OPENAI_MODEL_CANDIDATES = [
+    model.strip()
+    for model in os.getenv("OPENAI_MODEL_CANDIDATES", OPENAI_MODEL).split(",")
+    if model.strip()
+]
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-5.4-mini").strip() or "openai/gpt-5.4-mini"
+OPENROUTER_MODEL_CANDIDATES = [
+    model.strip()
+    for model in os.getenv(
+        "OPENROUTER_MODEL_CANDIDATES",
+        f"{OPENROUTER_MODEL},google/gemini-2.5-flash-lite,qwen/qwen3-30b-a3b,deepseek/deepseek-chat-v3-0324",
+    ).split(",")
+    if model.strip()
+]
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514").strip() or "claude-sonnet-4-20250514"
+ANTHROPIC_MODEL_CANDIDATES = [
+    model.strip()
+    for model in os.getenv("ANTHROPIC_MODEL_CANDIDATES", ANTHROPIC_MODEL).split(",")
+    if model.strip()
+]
+AI_PROVIDER_ORDER = [
+    provider.strip().lower()
+    for provider in os.getenv("AI_PROVIDER_ORDER", "gemini,openrouter,openai,anthropic").split(",")
+    if provider.strip()
+]
+APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Singapore").strip() or "Asia/Singapore"
+LOCAL_TIMEZONE = ZoneInfo(APP_TIMEZONE)
+DEFAULT_OBSIDIAN_VAULT_PATH = APP_DIR.parent.parent / "STOCKS VAULT"
+OBSIDIAN_VAULT_PATH = Path(
+    os.getenv("OBSIDIAN_VAULT_PATH", str(DEFAULT_OBSIDIAN_VAULT_PATH))
+).expanduser()
+OBSIDIAN_EXPORT_ENABLED = os.getenv("OBSIDIAN_EXPORT_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+OBSIDIAN_EXPORT_FOLDER = os.getenv("OBSIDIAN_EXPORT_FOLDER", "Trading Dashboard/Sectors").strip(
+) or "Trading Dashboard/Sectors"
+OBSIDIAN_EXPORT_TRIGGER_ORIGINS = {
+    origin.strip().lower()
+    for origin in os.getenv("OBSIDIAN_EXPORT_TRIGGER_ORIGINS", "view,manual,scheduled").split(",")
+    if origin.strip()
+}
+OBSIDIAN_EXPORT_BOARD_KINDS = {
+    kind.strip().lower()
+    for kind in os.getenv("OBSIDIAN_EXPORT_BOARD_KINDS", "watchlist,premarket,market-brief").split(",")
+    if kind.strip()
+}
+SCHEDULED_SCAN_ENABLED = os.getenv("SCHEDULED_SCAN_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+SCHEDULED_SCAN_TIMES = [
+    stamp.strip()
+    for stamp in os.getenv("SCHEDULED_SCAN_TIMES", "08:30,20:30").split(",")
+    if stamp.strip()
+]
+SCHEDULED_SCAN_BOARD_KINDS = {
+    kind.strip().lower()
+    for kind in os.getenv("SCHEDULED_SCAN_BOARD_KINDS", "premarket,watchlist,market-brief").split(",")
+    if kind.strip()
+}
+SCHEDULED_SCAN_STAGGER_SECONDS = int(os.getenv("SCHEDULED_SCAN_STAGGER_SECONDS", "8"))
+MARKET_BRIEF_MACRO_SYMBOLS = [
+    symbol.strip()
+    for symbol in os.getenv("MARKET_BRIEF_MACRO_SYMBOLS", "SPY,QQQ,IWM,DIA,^VIX,TLT").split(",")
+    if symbol.strip()
+]
+IB_CHART_BASE_URL = os.getenv(
+    "IB_CHART_BASE_URL",
+    "http://127.0.0.1:5001/ib_multichart.html",
+).strip() or "http://127.0.0.1:5001/ib_multichart.html"
 EXCHANGES = ["NASDAQ", "NYSE", "AMEX"]
-
-
-st.set_page_config(
-    page_title=APP_TITLE,
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-
-def inject_css() -> None:
-    # Streamlit does not expose a runtime `st.theme = "dark"` setter, so the app
-    # enforces a dark trading-dashboard look through page config + CSS.
-    st.markdown(
-        """
-        <style>
-        :root {
-            --line: rgba(255,255,255,0.08);
-            --text: #f5f7fb;
-            --muted: #8fa0b5;
-            --green: #3ddc97;
-            --red: #ff6b6b;
-            --orange: #ffb454;
-            --blue: #3b82f6;
-        }
-
-        .stApp {
-            background:
-                radial-gradient(circle at top right, rgba(59,130,246,0.12), transparent 24%),
-                radial-gradient(circle at left top, rgba(61,220,151,0.08), transparent 20%),
-                linear-gradient(180deg, #091018 0%, #06090f 100%);
-            color: var(--text);
-        }
-
-        [data-testid="stHeader"] {
-            background: rgba(0, 0, 0, 0);
-        }
-
-        [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #0b1118 0%, #0a0f15 100%);
-            border-right: 1px solid var(--line);
-        }
-
-        .block-container {
-            padding-top: 1.3rem;
-            padding-bottom: 2rem;
-        }
-
-        .app-hero {
-            background: linear-gradient(135deg, rgba(16,23,32,0.95), rgba(12,18,27,0.88));
-            border: 1px solid var(--line);
-            border-radius: 18px;
-            padding: 1.2rem 1.35rem 1.05rem 1.35rem;
-            margin-bottom: 1rem;
-            box-shadow: 0 18px 55px rgba(0,0,0,0.26);
-        }
-
-        .eyebrow {
-            color: var(--blue);
-            font-size: 0.8rem;
-            font-weight: 700;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-        }
-
-        .hero-title {
-            font-size: 1.95rem;
-            line-height: 1.12;
-            font-weight: 800;
-            color: var(--text);
-            margin: 0.25rem 0 0.35rem 0;
-        }
-
-        .hero-subtitle {
-            color: var(--muted);
-            font-size: 0.96rem;
-            margin-bottom: 0;
-            max-width: 72rem;
-        }
-
-        .metric-card {
-            background: linear-gradient(180deg, rgba(20,31,42,0.95), rgba(12,18,27,0.95));
-            border: 1px solid var(--line);
-            border-radius: 16px;
-            padding: 0.9rem 1rem;
-            min-height: 104px;
-        }
-
-        .metric-label {
-            color: var(--muted);
-            font-size: 0.8rem;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-            margin-bottom: 0.25rem;
-        }
-
-        .metric-value {
-            color: var(--text);
-            font-size: 1.55rem;
-            font-weight: 800;
-            line-height: 1.1;
-            margin-bottom: 0.2rem;
-        }
-
-        .metric-note {
-            color: var(--muted);
-            font-size: 0.86rem;
-        }
-
-        .table-header {
-            color: #dbe5f2;
-            font-size: 0.76rem;
-            font-weight: 800;
-            letter-spacing: 0.04em;
-            text-transform: uppercase;
-            padding: 0.55rem 0;
-        }
-
-        .cell {
-            color: var(--text);
-            font-size: 0.92rem;
-            padding-top: 0.42rem;
-            padding-bottom: 0.42rem;
-            min-height: 2.3rem;
-            display: flex;
-            align-items: center;
-        }
-
-        .cell.ticker {
-            font-weight: 800;
-            letter-spacing: 0.02em;
-        }
-
-        .subtext {
-            color: var(--muted);
-            font-size: 0.76rem;
-        }
-
-        .value-green {
-            color: var(--green);
-            font-weight: 700;
-        }
-
-        .value-red {
-            color: var(--red);
-            font-weight: 700;
-        }
-
-        .value-orange {
-            color: var(--orange);
-            font-weight: 800;
-        }
-
-        .grade-badge {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            min-width: 2.1rem;
-            padding: 0.23rem 0.55rem;
-            border-radius: 999px;
-            font-size: 0.8rem;
-            font-weight: 800;
-        }
-
-        .grade-a { color: #062514; background: rgba(61,220,151,0.95); }
-        .grade-b { color: #211100; background: rgba(255,180,84,0.95); }
-        .grade-c { color: #290707; background: rgba(255,107,107,0.95); }
-
-        .breaker-badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.2rem 0.55rem;
-            border-radius: 999px;
-            background: rgba(255,180,84,0.14);
-            color: var(--orange);
-            font-size: 0.74rem;
-            font-weight: 800;
-            margin-top: 0.2rem;
-        }
-
-        .catalyst-wrap {
-            display: block;
-            width: 100%;
-            line-height: 1.3;
-        }
-
-        .catalyst-summary {
-            color: var(--text);
-            font-size: 0.9rem;
-            font-weight: 600;
-            margin-bottom: 0.18rem;
-        }
-
-        .reasoning-line {
-            color: var(--muted);
-            font-size: 0.77rem;
-            margin-top: 0.16rem;
-            line-height: 1.35;
-        }
-
-        .reasoning-label {
-            color: #e6eef8;
-            font-weight: 700;
-        }
-
-        .news-link, .news-link:visited {
-            color: #c9d8ea;
-            text-decoration: none;
-        }
-
-        .news-link:hover {
-            color: #ffffff;
-            text-decoration: underline;
-        }
-
-        .news-line {
-            color: var(--muted);
-            font-size: 0.76rem;
-            margin-top: 0.12rem;
-        }
-
-        .sidebar-watch-card {
-            background: rgba(255,255,255,0.03);
-            border: 1px solid rgba(255,255,255,0.05);
-            border-radius: 12px;
-            padding: 0.7rem 0.8rem;
-            margin-bottom: 0.45rem;
-        }
-
-        .sidebar-watch-ticker {
-            font-weight: 800;
-            color: var(--text);
-        }
-
-        .sidebar-watch-meta {
-            color: var(--muted);
-            font-size: 0.78rem;
-            margin-top: 0.1rem;
-        }
-
-        .warning-note {
-            background: rgba(255,180,84,0.12);
-            border: 1px solid rgba(255,180,84,0.22);
-            border-radius: 12px;
-            color: #ffd9a0;
-            padding: 0.85rem 1rem;
-            font-size: 0.88rem;
-        }
-
-        /* Catalyst cell — new compact layout */
-        .catalyst-tags {
-            display: flex;
-            gap: 0.35rem;
-            align-items: center;
-            margin-bottom: 0.3rem;
-            flex-wrap: wrap;
-        }
-
-        .event-badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.15rem 0.5rem;
-            border-radius: 5px;
-            font-size: 0.7rem;
-            font-weight: 800;
-            letter-spacing: 0.04em;
-            text-transform: uppercase;
-        }
-        .event-ma       { background: rgba(139,92,246,0.2);  color: #c4b5fd; border: 1px solid rgba(139,92,246,0.35); }
-        .event-earnings { background: rgba(59,130,246,0.2);  color: #93c5fd; border: 1px solid rgba(59,130,246,0.35); }
-        .event-clinical { background: rgba(16,185,129,0.2);  color: #6ee7b7; border: 1px solid rgba(16,185,129,0.35); }
-        .event-commercial { background: rgba(245,158,11,0.2); color: #fcd34d; border: 1px solid rgba(245,158,11,0.35); }
-        .event-product  { background: rgba(14,165,233,0.2);  color: #7dd3fc; border: 1px solid rgba(14,165,233,0.35); }
-        .event-analyst  { background: rgba(99,102,241,0.2);  color: #a5b4fc; border: 1px solid rgba(99,102,241,0.35); }
-        .event-financing { background: rgba(239,68,68,0.18); color: #fca5a5; border: 1px solid rgba(239,68,68,0.3); }
-        .event-legal    { background: rgba(234,179,8,0.18);  color: #fde047; border: 1px solid rgba(234,179,8,0.3); }
-        .event-default  { background: rgba(148,163,184,0.12); color: #94a3b8; border: 1px solid rgba(148,163,184,0.2); }
-
-        .dir-badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.15rem 0.45rem;
-            border-radius: 5px;
-            font-size: 0.7rem;
-            font-weight: 700;
-        }
-        .dir-up    { background: rgba(61,220,151,0.12); color: var(--green); }
-        .dir-down  { background: rgba(255,107,107,0.12); color: var(--red); }
-        .dir-mixed { background: rgba(148,163,184,0.1); color: #94a3b8; }
-
-        .catalyst-headline {
-            font-size: 0.88rem;
-            font-weight: 500;
-            color: var(--text);
-            line-height: 1.35;
-            margin-bottom: 0.15rem;
-        }
-
-        .catalyst-stats {
-            font-size: 0.75rem;
-            color: var(--muted);
-            margin-top: 0.18rem;
-            margin-bottom: 0.18rem;
-            letter-spacing: 0.01em;
-        }
-
-        .catalyst-edge {
-            font-size: 0.82rem;
-            color: #c8d8ec;
-            font-weight: 500;
-            margin-top: 0.22rem;
-            line-height: 1.35;
-            border-left: 2px solid rgba(59,130,246,0.4);
-            padding-left: 0.45rem;
-        }
-
-        /* ── LLM analyst breakdown ─────────────────────────── */
-
-        /* Catalyst quality badge */
-        .cq-badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.18rem 0.52rem;
-            border-radius: 999px;
-            font-size: 0.68rem;
-            font-weight: 800;
-            letter-spacing: 0.06em;
-            text-transform: uppercase;
-            margin-left: 0.35rem;
-        }
-        .cq-high    { background: rgba(61,220,151,0.15); color: #3ddc97; border: 1px solid rgba(61,220,151,0.3); }
-        .cq-medium  { background: rgba(255,180,84,0.12); color: #ffb454; border: 1px solid rgba(255,180,84,0.3); }
-        .cq-low     { background: rgba(255,107,107,0.12); color: #ff6b6b; border: 1px solid rgba(255,107,107,0.25); }
-
-        .cq-reason {
-            font-size: 0.77rem;
-            color: #8fa0b5;
-            font-style: italic;
-            margin-top: 0.1rem;
-            margin-bottom: 0.18rem;
-            line-height: 1.35;
-        }
-
-        /* Story */
-        .catalyst-story {
-            font-size: 0.85rem;
-            color: #d4e2f0;
-            line-height: 1.5;
-            margin-top: 0.22rem;
-            margin-bottom: 0.2rem;
-        }
-
-        /* Mechanism */
-        .catalyst-mechanism {
-            font-size: 0.79rem;
-            color: #7ba8d4;
-            line-height: 1.4;
-            margin-bottom: 0.22rem;
-            padding-left: 0.5rem;
-            border-left: 2px solid rgba(59,130,246,0.35);
-        }
-
-        /* Bull / Bear grid */
-        .bull-bear-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 0.4rem;
-            margin-top: 0.2rem;
-        }
-
-        .bb-block {
-            border-radius: 7px;
-            padding: 0.32rem 0.48rem;
-        }
-
-        .bb-block.bull { background: rgba(61,220,151,0.07); border: 1px solid rgba(61,220,151,0.18); }
-        .bb-block.bear { background: rgba(255,107,107,0.07); border: 1px solid rgba(255,107,107,0.18); }
-
-        .bb-label {
-            font-size: 0.67rem;
-            font-weight: 800;
-            letter-spacing: 0.07em;
-            text-transform: uppercase;
-            display: block;
-            margin-bottom: 0.18rem;
-        }
-        .bb-label.bull { color: var(--green); }
-        .bb-label.bear { color: var(--red); }
-
-        .bb-item {
-            font-size: 0.78rem;
-            color: #b8cfe4;
-            line-height: 1.4;
-            padding-left: 0.75rem;
-            position: relative;
-            margin-bottom: 0.14rem;
-        }
-        .bb-item::before {
-            content: "•";
-            position: absolute;
-            left: 0;
-            color: #5a7a99;
-        }
-
-        /* Trade structure */
-        .trade-structure-row {
-            display: flex;
-            align-items: flex-start;
-            gap: 0.4rem;
-            margin-top: 0.28rem;
-        }
-        .ts-badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.18rem 0.52rem;
-            border-radius: 999px;
-            font-size: 0.68rem;
-            font-weight: 800;
-            letter-spacing: 0.04em;
-            white-space: nowrap;
-            flex-shrink: 0;
-        }
-        .ts-go     { background: rgba(61,220,151,0.13); color: #3ddc97; border: 1px solid rgba(61,220,151,0.28); }
-        .ts-fade   { background: rgba(255,107,107,0.12); color: #ff6b6b; border: 1px solid rgba(255,107,107,0.25); }
-        .ts-multi  { background: rgba(59,130,246,0.12); color: #7ab3f5; border: 1px solid rgba(59,130,246,0.28); }
-        .ts-reason {
-            font-size: 0.77rem;
-            color: #8fa0b5;
-            line-height: 1.38;
-        }
-
-        /* Re-rating */
-        .catalyst-rerating {
-            margin-top: 0.28rem;
-            padding: 0.28rem 0.52rem;
-            border-radius: 6px;
-            font-size: 0.8rem;
-            line-height: 1.42;
-            display: flex;
-            gap: 0.4rem;
-            align-items: flex-start;
-        }
-        .rerating-label {
-            font-weight: 800;
-            font-size: 0.68rem;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-            white-space: nowrap;
-            padding-top: 0.05rem;
-            flex-shrink: 0;
-        }
-        .rerating-yes     { border: 1px solid rgba(61,220,151,0.28); background: rgba(61,220,151,0.07); }
-        .rerating-yes     .rerating-label { color: #3ddc97; }
-        .rerating-yes     .rerating-reason-text { color: #b0e8ce; }
-        .rerating-no      { border: 1px solid rgba(148,163,184,0.18); background: rgba(148,163,184,0.04); }
-        .rerating-no      .rerating-label { color: #64748b; }
-        .rerating-no      .rerating-reason-text { color: #8fa0b5; }
-        .rerating-partial { border: 1px solid rgba(255,180,84,0.25); background: rgba(255,180,84,0.07); }
-        .rerating-partial .rerating-label { color: #ffb454; }
-        .rerating-partial .rerating-reason-text { color: #f5c97a; }
-
-        .rerating-reason-text { font-size: 0.8rem; line-height: 1.42; }
-
-        .no-api-note {
-            font-size: 0.74rem;
-            color: #4a6a88;
-            margin-top: 0.18rem;
-            font-style: italic;
-        }
-
-        /* ── Deep-dive expander sections ─────────────────────── */
-        .deep-section {
-            margin-bottom: 0.9rem;
-        }
-        .deep-label {
-            font-size: 0.68rem;
-            font-weight: 800;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            color: #7ba8d4;
-            margin-bottom: 0.28rem;
-            display: flex;
-            align-items: center;
-            gap: 0.35rem;
-        }
-        .deep-label::after {
-            content: "";
-            flex: 1;
-            height: 1px;
-            background: rgba(255,255,255,0.06);
-        }
-        .deep-text {
-            font-size: 0.86rem;
-            color: #ccdaec;
-            line-height: 1.55;
-        }
-        .deep-text-muted {
-            font-size: 0.83rem;
-            color: #8fa0b5;
-            line-height: 1.5;
-        }
-        .deep-story-before {
-            font-size: 0.83rem;
-            color: #6b8299;
-            line-height: 1.5;
-            padding: 0.3rem 0.55rem;
-            border-left: 2px solid rgba(148,163,184,0.2);
-            margin-bottom: 0.3rem;
-        }
-        .deep-story-after {
-            font-size: 0.87rem;
-            color: #d4e2f0;
-            line-height: 1.55;
-            padding: 0.3rem 0.55rem;
-            border-left: 2px solid rgba(59,130,246,0.4);
-        }
-        .deep-float-block {
-            font-size: 0.84rem;
-            color: #b8cfe4;
-            line-height: 1.5;
-            padding: 0.35rem 0.55rem;
-            background: rgba(59,130,246,0.06);
-            border-radius: 6px;
-            border: 1px solid rgba(59,130,246,0.14);
-        }
-        .deep-uncertainty {
-            font-size: 0.85rem;
-            color: #f5c97a;
-            line-height: 1.5;
-            padding: 0.35rem 0.6rem;
-            background: rgba(255,180,84,0.07);
-            border-radius: 6px;
-            border: 1px solid rgba(255,180,84,0.2);
-        }
-        .deep-dilution {
-            font-size: 0.83rem;
-            color: #ff9f9f;
-            line-height: 1.5;
-            padding: 0.3rem 0.55rem;
-            background: rgba(255,107,107,0.06);
-            border-radius: 6px;
-            border: 1px solid rgba(255,107,107,0.15);
-        }
-        .deep-dilution.safe {
-            color: #8fa0b5;
-            background: rgba(148,163,184,0.04);
-            border-color: rgba(148,163,184,0.12);
-        }
-        .deep-entry {
-            font-size: 0.84rem;
-            color: #b0e8ce;
-            line-height: 1.5;
-            padding: 0.35rem 0.55rem;
-            background: rgba(61,220,151,0.06);
-            border-radius: 6px;
-            border: 1px solid rgba(61,220,151,0.15);
-            margin-bottom: 0.4rem;
-        }
-        .deep-invalidation {
-            font-size: 0.84rem;
-            color: #ffb4b4;
-            line-height: 1.5;
-            padding: 0.35rem 0.55rem;
-            background: rgba(255,107,107,0.06);
-            border-radius: 6px;
-            border: 1px solid rgba(255,107,107,0.15);
-        }
-        .durability-badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.18rem 0.52rem;
-            border-radius: 999px;
-            font-size: 0.68rem;
-            font-weight: 800;
-            letter-spacing: 0.04em;
-            margin-right: 0.4rem;
-            background: rgba(59,130,246,0.12);
-            color: #7ab3f5;
-            border: 1px solid rgba(59,130,246,0.25);
-        }
-        .bb-block-wide { border-radius: 8px; padding: 0.5rem 0.65rem; margin-bottom: 0.2rem; }
-        .bb-item-wide {
-            font-size: 0.84rem;
-            color: #c8d8ec;
-            line-height: 1.5;
-            padding: 0.2rem 0 0.2rem 1rem;
-            position: relative;
-        }
-        .bb-item-wide::before { content: "•"; position: absolute; left: 0; color: #4a6a88; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def now_et() -> datetime:
-    return datetime.now(NEW_YORK_TZ)
-
-
-def market_session_status() -> tuple[str, bool]:
-    current = now_et().time()
-    if time(4, 0) <= current < time(9, 30):
-        return "US Premarket", True
-    if time(9, 30) <= current < time(16, 0):
-        return "US Regular Session", False
-    if time(16, 0) <= current < time(20, 0):
-        return "US After Hours", False
-    return "US Market Closed", False
-
-
-def compact_number(value: Any, suffix: str = "") -> str:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return "N/A"
-    number = float(value)
-    abs_number = abs(number)
-    if abs_number >= 1_000_000_000:
-        return f"{number / 1_000_000_000:.2f}B{suffix}"
-    if abs_number >= 1_000_000:
-        return f"{number / 1_000_000:.2f}M{suffix}"
-    if abs_number >= 1_000:
-        return f"{number / 1_000:.1f}K{suffix}"
-    if number.is_integer():
-        return f"{int(number)}{suffix}"
-    return f"{number:.2f}{suffix}"
-
-
-def format_price(value: Any) -> str:
-    if value is None or pd.isna(value):
-        return "N/A"
-    return f"${float(value):.2f}"
-
-
-def format_ratio(value: Any) -> str:
-    if value is None or pd.isna(value):
-        return "N/A"
-    return f"{float(value):.2f}x"
-
-
-def format_gap_html(value: Any) -> str:
-    if value is None or pd.isna(value):
-        return '<span class="cell">N/A</span>'
-    css = "value-green" if float(value) >= 0 else "value-red"
-    return f'<span class="{css}">{float(value):+.2f}%</span>'
-
-
-def grade_html(grade: str) -> str:
-    css = {"A": "grade-a", "B": "grade-b", "C": "grade-c"}.get(grade, "grade-b")
-    return f'<span class="grade-badge {css}">{html.escape(grade)}</span>'
-
-
-def clean_headline(headline: str, ticker: str) -> str:
-    cleaned = re.sub(r"\s+", " ", str(headline or "")).strip()
-    cleaned = re.sub(rf"^{re.escape(ticker)}\s*[:\-]\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*\([^)]*\)\s*$", "", cleaned)
-    return cleaned.rstrip(". ")
-
-
-def get_company_descriptor(ticker: str, industry: str | None, sector: str | None) -> str:
-    if industry and str(industry).strip():
-        return f"this {str(industry).lower()} name"
-    if sector and str(sector).strip():
-        return f"this {str(sector).lower()} stock"
-    return ticker
-
-
-def get_float_descriptor(float_shares: Any) -> str:
-    if float_shares is None or pd.isna(float_shares):
-        return "an unclear float profile"
-    float_shares = float(float_shares)
-    if float_shares < 5_000_000:
-        return "a very tight float"
-    if float_shares < 20_000_000:
-        return "a low float"
-    if float_shares < 100_000_000:
-        return "a mid-sized float"
-    return "a large float"
-
-
-def classify_headline(primary: str) -> tuple[str, str]:
-    lowered = primary.lower()
-    positive_keywords = (
-        "acquire",
-        "acquisition",
-        "merger",
-        "takeover",
-        "buyout",
-        "partnership",
-        "agreement",
-        "deal",
-        "contract",
-        "lease",
-        "approval",
-        "fda",
-        "launch",
-        "wins",
-        "award",
-        "grant",
-        "beat",
-        "raises",
-        "ai chip",
-    )
-    negative_keywords = (
-        "offering",
-        "dilution",
-        "priced",
-        "bankruptcy",
-        "miss",
-        "guidance cut",
-        "cuts guidance",
-        "withdrawn",
-        "delay",
-        "investigation",
-        "lawsuit",
-        "downgrade",
-        "resign",
-        "going concern",
-        "delist",
-    )
-    event_map = [
-        (("acquire", "acquisition", "merger", "takeover", "buyout"), "M&A"),
-        (("earnings", "guidance", "revenue", "profit", "forecast", "result", "results"), "Earnings"),
-        (("fda", "approval", "trial", "phase", "clinical", "study"), "Clinical"),
-        (("partnership", "agreement", "deal", "contract", "lease", "award"), "Commercial"),
-        (("launch", "chip", "platform", "product", "ai"), "Product"),
-        (("upgrade", "downgrade", "rating", "price target"), "Analyst"),
-        (("offering", "financing", "private placement"), "Financing"),
-        (("lawsuit", "probe", "investigation"), "Legal"),
-    ]
-    event_label = "Headline"
-    for keywords, label in event_map:
-        if any(keyword in lowered for keyword in keywords):
-            event_label = label
-            break
-
-    has_positive = any(keyword in lowered for keyword in positive_keywords)
-    has_negative = any(keyword in lowered for keyword in negative_keywords)
-    if has_negative and not has_positive:
-        direction = "negative"
-    elif has_positive and not has_negative:
-        direction = "positive"
-    else:
-        direction = "mixed"
-    return event_label, direction
-
-
-def clean_metric(value: Any) -> str | None:
+DEFAULT_SHARED_WATCHLIST_URLS = [
+    "https://www.tradingview.com/watchlists/323151534/",
+    "https://www.tradingview.com/watchlists/315855742/",
+    "https://www.tradingview.com/watchlists/315856199/",
+    "https://www.tradingview.com/watchlists/316344074/",
+    "https://www.tradingview.com/watchlists/324104365/",
+    "https://www.tradingview.com/watchlists/315855592/",
+    "https://www.tradingview.com/watchlists/316749547/",
+    "https://www.tradingview.com/watchlists/319031060/",
+    "https://www.tradingview.com/watchlists/315855978/",
+    "https://www.tradingview.com/watchlists/315857640/",
+    "https://www.tradingview.com/watchlists/315857161/",
+    "https://www.tradingview.com/watchlists/320852057/",
+]
+WATCHLIST_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
+MAX_MERGED_NEWS_ITEMS = int(os.getenv("MAX_MERGED_NEWS_ITEMS", "12"))
+MAX_YFINANCE_NEWS_ITEMS = int(os.getenv("MAX_YFINANCE_NEWS_ITEMS", "8"))
+
+CATEGORY_OPTIONS = [
+    "Earnings",
+    "FDA / Clinical",
+    "PR / Contract",
+    "Financing / Offering",
+    "Analyst / Upgrade",
+    "M&A / Rumor",
+    "Sympathy / Sector",
+    "Low Float Momentum",
+    "No Fresh News",
+]
+
+CATEGORY_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
+    ("M&A / Rumor", ("acquire", "acquires", "acquired", "acquisition", "deal", "merger", "buyout", "takeover", "stake", "agrees")),
+    ("Financing / Offering", ("offering", "financing", "loan", "credit facility", "notes", "convertible", "raises", "investment", "stake sale", "capital", "funding", "facility", "backed by", "non-dilutive")),
+    ("FDA / Clinical", ("fda", "phase", "trial", "clinical", "approval", "pivotal", "bLA", "supplemental", "study", "submission")),
+    ("Earnings", ("earnings", "guidance", "revenue", "eps", "quarter", "sales", "results")),
+    ("PR / Contract", ("contract", "award", "order", "partnership", "agreement", "launch missions", "secures", "wins", "collaboration", "construct", "factory", "build", "expansion", "capacity", "facility", "unveiling")),
+    ("Analyst / Upgrade", ("upgrade", "downgrade", "price target", "initiates", "coverage", "rating")),
+    ("Sympathy / Sector", ("sector", "peer", "industry", "stocks jump", "shares rise", "nasdaq", "dow", "market", "war", "fed", "macro")),
+]
+
+MACRO_NEWS_HINTS = {
+    "nasdaq", "dow", "s&p", "sp500", "market", "stocks jump", "war", "trump",
+    "fed", "rates", "macro", "treasury", "yields", "futures", "sector",
+}
+
+LEGAL_ALERT_HINTS = {
+    "sued", "investigation", "class action", "law group", "law violations",
+    "shareholder alert", "discuss your rights", "deadline", "lawsuit",
+}
+
+COMMENTARY_HEADLINE_HINTS = {
+    "bets big",
+    "dear ",
+    "explains why",
+    "here's what",
+    "here’s what",
+    "jim cramer",
+    "means for",
+    "outshining",
+    "winner",
+    "what investors need to know",
+    "what happens when",
+    "best buy now",
+    "three key reasons",
+    "reasons to hold",
+    "reasons to buy",
+    "stock now",
+    "should you buy",
+    "is it a buy",
+    "neophyte",
+    "why the",
+    "why it's",
+    "why its",
+}
+
+HIGH_TRUST_NEWS_SOURCES = {
+    "associated press",
+    "bloomberg",
+    "business wire",
+    "dow jones",
+    "globenewswire",
+    "marketwatch",
+    "new york times",
+    "pr newswire",
+    "reuters",
+    "the associated press",
+    "the wall street journal",
+    "wall street journal",
+}
+
+LOW_SIGNAL_NEWS_SOURCES = {
+    "24/7 wall st.",
+    "gurufocus.com",
+    "insider monkey",
+    "investorplace",
+    "motley fool",
+    "schaeffer's research",
+    "simply wall st.",
+    "stockstory",
+    "tipranks",
+    "zacks",
+}
+
+LOW_SIGNAL_EVENT_NOTICE_HINTS = {
+    "conference call",
+    "earnings call",
+    "webcast",
+    "fireside chat",
+    "to present",
+    "to participate",
+    "investor conference",
+    "investor day",
+    "conference appearance",
+    "live at",
+    "summit",
+    "panel discussion",
+    "annual meeting",
+}
+
+CONCRETE_EVENT_HINTS = {
+    "agrees",
+    "approval",
+    "award",
+    "backed by",
+    "build",
+    "closes",
+    "collaboration",
+    "confirms",
+    "construct",
+    "contract",
+    "deal",
+    "expansion",
+    "factory",
+    "financing",
+    "funding",
+    "guidance",
+    "investment",
+    "launch",
+    "loan",
+    "merger",
+    "non-dilutive",
+    "order",
+    "partnership",
+    "phase",
+    "pivotal",
+    "receives",
+    "results",
+    "secures",
+    "stake",
+    "submission",
+    "trial",
+    "unveiling",
+    "wins",
+}
+
+POSITIVE_FINANCING_HINTS = {
+    "backed by",
+    "credit facility",
+    "facility",
+    "funding",
+    "gpu-backed",
+    "investment",
+    "loan",
+    "non-dilutive",
+    "secured",
+    "secures",
+}
+
+DILUTIVE_FINANCING_HINTS = {
+    "atm",
+    "convertible",
+    "offering",
+    "private placement",
+    "registered direct",
+    "share sale",
+    "warrant",
+}
+
+DIRECT_CATALYST_CATEGORIES = {
+    "Earnings",
+    "FDA / Clinical",
+    "PR / Contract",
+    "Financing / Offering",
+    "Analyst / Upgrade",
+    "M&A / Rumor",
+}
+
+AI_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "category": {"type": "string", "enum": CATEGORY_OPTIONS},
+        "grade": {"type": "string", "enum": ["A", "B", "C", "D"]},
+        "reasoning": {"type": "string"},
+        "analysis_details": {"type": "string"},
+    },
+    "required": ["category", "grade", "reasoning", "analysis_details"],
+}
+
+GRADE_ORDER = {"A": 0, "B": 1, "C": 2, "D": 3}
+ANALYSIS_CACHE: dict[str, dict[str, Any]] = {}
+ANALYSIS_CACHE_LOCK = threading.RLock()
+MARKET_BRIEF_CACHE: dict[str, dict[str, Any]] = {}
+MARKET_BRIEF_CACHE_LOCK = threading.RLock()
+NEWS_CACHE: dict[str, dict[str, Any]] = {}
+NEWS_CACHE_LOCK = threading.RLock()
+GEMINI_CLIENT_LOCK = threading.RLock()
+GEMINI_CLIENT: genai.Client | None = None
+AI_STATE_LOCK = threading.RLock()
+AI_PROVIDER_COOLDOWNS: dict[str, float] = {}
+WATCHLIST_CACHE_LOCK = threading.RLock()
+WATCHLIST_CACHE: dict[str, dict[str, Any]] = {}
+BOARD_DEFINITIONS_LOCK = threading.RLock()
+BOARD_DEFINITIONS_CACHE: list[dict[str, Any]] | None = None
+OPENROUTER_REQUEST_SEMAPHORE = threading.Semaphore(max(1, OPENROUTER_MAX_CONCURRENCY))
+
+
+def provider_display_name(provider: str) -> str:
+    names = {
+        "gemini": "Gemini",
+        "openrouter": "OpenRouter",
+        "openai": "OpenAI",
+        "anthropic": "Anthropic",
+        "fallback": "Fallback",
+    }
+    return names.get(provider.lower(), provider.title())
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def local_now() -> datetime:
+    return datetime.now(LOCAL_TIMEZONE)
+
+
+def to_local_time(value: datetime | None) -> datetime | None:
     if value is None:
         return None
-    text = str(value).strip()
-    if not text or text == "-":
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(LOCAL_TIMEZONE)
+
+
+def to_epoch(value: datetime | None) -> int | None:
+    if value is None:
         return None
-    return text
+    return int(value.timestamp())
+
+
+def to_local_epoch(value: datetime | None) -> int | None:
+    local_value = to_local_time(value)
+    if local_value is None:
+        return None
+    return int(local_value.timestamp())
+
+
+def parse_schedule_times(time_strings: list[str]) -> list[tuple[int, int]]:
+    parsed: list[tuple[int, int]] = []
+    for stamp in time_strings:
+        try:
+            hour_text, minute_text = stamp.split(":", 1)
+            parsed.append((int(hour_text), int(minute_text)))
+        except ValueError:
+            continue
+    return sorted(set(parsed))
+
+
+def format_schedule_times_label() -> str:
+    labels = []
+    for hour, minute in parse_schedule_times(SCHEDULED_SCAN_TIMES):
+        labels.append(datetime(2000, 1, 1, hour, minute).strftime("%I:%M %p").lstrip("0"))
+    if not labels:
+        return "Disabled"
+    return " & ".join(labels) + f" {APP_TIMEZONE}"
+
+
+def next_scheduled_run_local(from_time: datetime | None = None) -> datetime | None:
+    schedule_times = parse_schedule_times(SCHEDULED_SCAN_TIMES)
+    if not schedule_times:
+        return None
+
+    current = from_time or local_now()
+    candidates: list[datetime] = []
+    for day_offset in (0, 1, 2):
+        base_date = (current + timedelta(days=day_offset)).date()
+        for hour, minute in schedule_times:
+            candidates.append(datetime(base_date.year, base_date.month, base_date.day, hour, minute, tzinfo=LOCAL_TIMEZONE))
+    for candidate in sorted(candidates):
+        if candidate >= current:
+            return candidate
+    return None
+
+
+def current_schedule_slot_key(current: datetime | None = None) -> str | None:
+    schedule_times = parse_schedule_times(SCHEDULED_SCAN_TIMES)
+    if not schedule_times:
+        return None
+    now_value = current or local_now()
+    for hour, minute in schedule_times:
+        slot = now_value.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if 0 <= (now_value - slot).total_seconds() < 60:
+            return slot.strftime("%Y-%m-%d %H:%M")
+    return None
+
+
+def finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return number
+
+
+def finite_int(value: Any, default: int = 0) -> int:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return int(number)
+
+
+def sanitize_json_compatible(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: sanitize_json_compatible(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_json_compatible(item) for item in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
 
 
 def parse_metric_number(value: Any) -> float | None:
-    text = clean_metric(value)
-    if text is None:
+    if value is None:
         return None
-    text = text.replace(",", "")
-    multiplier = 1.0
-    if text.endswith("%"):
-        text = text[:-1]
-    elif text.endswith("B"):
-        multiplier = 1_000_000_000
-        text = text[:-1]
-    elif text.endswith("M"):
-        multiplier = 1_000_000
-        text = text[:-1]
-    elif text.endswith("K"):
-        multiplier = 1_000
-        text = text[:-1]
+    if isinstance(value, (int, float)):
+        if pd.isna(value):
+            return None
+        return float(value)
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "-", "--", "n/a"}:
+        return None
+
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1]
+
+    text = text.replace(",", "").replace("%", "").strip()
+    match = re.match(r"^(-?\d+(?:\.\d+)?)([KMBT])?$", text, re.IGNORECASE)
+    if match:
+        base = float(match.group(1))
+        suffix = (match.group(2) or "").upper()
+        multiplier = {"": 1, "K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}[suffix]
+        result = base * multiplier
+        return -result if negative else result
+
     try:
-        return float(text) * multiplier
+        result = float(text)
     except ValueError:
         return None
+    return -result if negative else result
 
 
-def build_fundamental_context(fundamentals: dict[str, Any]) -> tuple[str, str]:
-    sales_qoq = clean_metric(fundamentals.get("Sales Q/Q"))
-    eps_qoq = clean_metric(fundamentals.get("EPS Q/Q"))
-    profit_margin = clean_metric(fundamentals.get("Profit Margin"))
-    debt_eq = clean_metric(fundamentals.get("Debt/Eq"))
-    market_cap = clean_metric(fundamentals.get("Market Cap"))
-    cash_per_share = clean_metric(fundamentals.get("Cash/sh"))
+def compact_number(value: Any, decimals: int = 1) -> str:
+    number = parse_metric_number(value)
+    if number is None:
+        return "-"
+    absolute = abs(number)
+    suffix = ""
+    divisor = 1.0
+    if absolute >= 1e12:
+        suffix, divisor = "T", 1e12
+    elif absolute >= 1e9:
+        suffix, divisor = "B", 1e9
+    elif absolute >= 1e6:
+        suffix, divisor = "M", 1e6
+    elif absolute >= 1e3:
+        suffix, divisor = "K", 1e3
 
-    context_parts = []
-    if market_cap:
-        context_parts.append(f"{market_cap} market cap")
-    if sales_qoq:
-        context_parts.append(f"sales Q/Q {sales_qoq}")
-    if eps_qoq:
-        context_parts.append(f"EPS Q/Q {eps_qoq}")
-    if profit_margin:
-        context_parts.append(f"profit margin {profit_margin}")
-    context = ", ".join(context_parts[:4]) if context_parts else "limited disclosed momentum"
-
-    profit_margin_num = parse_metric_number(profit_margin)
-    debt_eq_num = parse_metric_number(debt_eq)
-    sales_qoq_num = parse_metric_number(sales_qoq)
-    eps_qoq_num = parse_metric_number(eps_qoq)
-    cash_num = parse_metric_number(cash_per_share)
-
-    health_parts = []
-    if profit_margin_num is not None:
-        if profit_margin_num < 0:
-            health_parts.append("loss-making")
-        elif profit_margin_num > 10:
-            health_parts.append("already profitable")
-        else:
-            health_parts.append("near break-even")
-    if sales_qoq_num is not None:
-        if sales_qoq_num > 25:
-            health_parts.append("showing strong top-line acceleration")
-        elif sales_qoq_num < 0:
-            health_parts.append("still dealing with shrinking sales")
-    if eps_qoq_num is not None:
-        if eps_qoq_num > 25:
-            health_parts.append("with improving earnings leverage")
-        elif eps_qoq_num < 0:
-            health_parts.append("with deteriorating earnings power")
-    if debt_eq_num is not None:
-        if debt_eq_num > 1:
-            health_parts.append("and a leveraged balance sheet")
-        elif debt_eq_num == 0:
-            health_parts.append("and essentially no balance-sheet leverage")
-    elif cash_num is not None and cash_num > 1:
-        health_parts.append("with some cash cushion")
-
-    if not health_parts:
-        health = "with a still-developing fundamental profile"
-    else:
-        health = " ".join(health_parts)
-    return context, health
+    if suffix:
+        scaled = number / divisor
+        if abs(scaled) >= 100:
+            return f"{scaled:.0f}{suffix}"
+        if abs(scaled) >= 10:
+            return f"{scaled:.1f}{suffix}"
+        return f"{scaled:.{decimals}f}{suffix}"
+    return f"{number:,.0f}"
 
 
-def build_fundamental_change(
-    event_label: str,
-    direction: str,
-    fundamentals: dict[str, Any],
-    primary_headline: str,
-) -> str:
-    context, health = build_fundamental_context(fundamentals)
-
-    if event_label == "M&A":
-        return (
-            f"On fundamentals, the key shift is from standalone execution risk to a defined deal-value setup. "
-            f"This name comes in with {context} and is {health}, so an acquisition headline matters because it can override weak standalone forecasts and anchor valuation to the transaction terms."
-        )
-    if event_label == "Commercial":
-        return (
-            f"On fundamentals, the market is asking whether the news can translate into recurring revenue, not just attention. "
-            f"With {context} and the business {health}, the partnership/contract only deserves a rerating if it improves revenue visibility, customer quality, or margin absorption."
-        )
-    if event_label == "Product":
-        return (
-            f"On fundamentals, the story is about monetization and TAM expansion. "
-            f"With {context} and the company {health}, traders will watch whether this product news can lift future sales growth or improve the quality of gross profit rather than remain narrative-only."
-        )
-    if event_label == "Clinical":
-        return (
-            f"On fundamentals, this is a probability-of-cash-flow event. "
-            f"Given {context} and a company that is {health}, the headline matters because it can materially change the odds of future commercialization, financing terms, or dilution risk."
-        )
-    if event_label == "Financing":
-        if direction == "negative":
-            return (
-                f"On fundamentals, financing changes the runway but can hurt per-share value. "
-                f"With {context} and the business {health}, the market will weigh extra survival time against dilution, cost of capital, and how far the company still is from self-funding."
-            )
-        return (
-            f"On fundamentals, financing can de-risk near-term operations if the company needed capital. "
-            f"With {context} and the business {health}, the real test is whether the fresh capital improves execution more than it dilutes ownership."
-        )
-    if event_label == "Earnings":
-        if direction == "negative":
-            return (
-                f"On fundamentals, the market is de-rating forward earnings power. "
-                f"The setup already showed {context} and the company is {health}, so weak earnings-type news pushes investors to pay less for future cash flow until growth or margins stabilize."
-            )
-        if direction == "mixed":
-            return (
-                f"On fundamentals, the market is refreshing its earnings model rather than reacting to a clean beat-or-miss headline. "
-                f"The setup already showed {context} and the company is {health}, so traders will focus on what changed in margins, guidance credibility, and the path of future estimates."
-            )
-        return (
-            f"On fundamentals, the market is repricing future earnings power higher. "
-            f"The setup already showed {context} and the company is {health}, so strong earnings-type news matters if it supports a better sales trajectory, margin expansion, or cleaner guidance base."
-        )
-    if event_label == "Analyst":
-        return (
-            f"On fundamentals, analyst headlines do not change the business by themselves. "
-            f"Still, with {context} and the company {health}, a rating change can pull new sponsorship into the name if it aligns with improving operating trends."
-        )
-    if event_label == "Legal":
-        return (
-            f"On fundamentals, legal or regulatory headlines change the discount rate more than the income statement at first. "
-            f"With {context} and the company {health}, traders will assume a lower valuation multiple until the liability, cost, or operational impact becomes clearer."
-        )
-    return (
-        f"On fundamentals, the news only matters if it changes future cash flows, funding risk, or valuation multiples. "
-        f"Right now the company screens at {context} and is {health}, so the follow-through depends on whether the headline improves the business outlook instead of just attracting one-day volume."
-    )
+def format_percent(value: Any, decimals: int = 1, always_sign: bool = True) -> str:
+    number = parse_metric_number(value)
+    if number is None:
+        return "-"
+    sign = "+" if always_sign and number > 0 else ""
+    return f"{sign}{number:.{decimals}f}%"
 
 
-def get_market_cap_descriptor(market_cap_num: float | None) -> str:
-    if market_cap_num is None:
-        return "unclear-size"
-    if market_cap_num < 100_000_000:
-        return "micro-cap"
-    if market_cap_num < 2_000_000_000:
-        return "small-cap"
-    if market_cap_num < 10_000_000_000:
-        return "mid-cap"
-    return "large-cap"
+def clean_symbol(symbol: str) -> str:
+    return re.sub(r"[^A-Z0-9.\-]", "", str(symbol or "").upper())
 
 
-def get_fundamental_quality_bucket(fundamentals: dict[str, Any]) -> str:
-    sales_qoq = parse_metric_number(fundamentals.get("Sales Q/Q"))
-    eps_qoq = parse_metric_number(fundamentals.get("EPS Q/Q"))
-    profit_margin = parse_metric_number(fundamentals.get("Profit Margin"))
-    debt_eq = parse_metric_number(fundamentals.get("Debt/Eq"))
-
-    if profit_margin is not None and profit_margin > 10 and (sales_qoq is None or sales_qoq >= 10):
-        return "quality"
-    if profit_margin is not None and profit_margin >= 0:
-        return "profitable"
-    if profit_margin is not None and profit_margin < 0 and sales_qoq is not None and sales_qoq > 25:
-        return "speculative-growth"
-    if profit_margin is not None and profit_margin < 0 and sales_qoq is not None and sales_qoq < 0:
-        return "weak"
-    if debt_eq is not None and debt_eq > 1.5:
-        return "leveraged"
-    return "mixed"
-
-
-def build_repricing_frame(event_label: str, direction: str, grade: str) -> tuple[str, str]:
-    if event_label == "M&A":
-        return "standalone execution and valuation uncertainty", "transaction value and deal-completion odds"
-    if event_label == "Commercial":
-        return "speculation about future demand", "revenue visibility and customer quality"
-    if event_label == "Product":
-        return "narrative optionality", "adoption, monetization, and TAM credibility"
-    if event_label == "Clinical":
-        return "binary science risk", "probability-adjusted commercialization value"
-    if event_label == "Financing" and direction == "negative":
-        return "upside optionality", "dilution math, runway, and cost of capital"
-    if event_label == "Financing":
-        return "survival risk", "runway extension and execution capacity"
-    if event_label == "Earnings" and direction == "negative":
-        return "old estimates and prior multiple support", "lower forward earnings power and multiple compression"
-    if event_label == "Earnings" and direction == "positive":
-        return "old estimates", "higher forward earnings power and a revised guidance base"
-    if event_label == "Earnings":
-        return "old estimates and assumptions", "fresh evidence about earnings power and guidance credibility"
-    if event_label == "Legal":
-        return "business execution", "liability risk and a higher discount rate"
-    if event_label == "Analyst":
-        return "an underfollowed setup", "potential sponsorship and re-anchored expectations"
-    if direction == "positive" and grade == "C":
-        return "a broken chart and low confidence", "possible change-of-character if the catalyst proves durable"
-    if direction == "positive":
-        return "background momentum", "a more explicit catalyst-backed repricing"
-    if direction == "negative":
-        return "prior confidence", "a more defensive valuation framework"
-    return "relative neglect", "active price discovery"
-
-
-def build_positioning_note(
-    row: dict[str, Any],
-    fundamentals: dict[str, Any],
-    direction: str,
-    market_cap_desc: str,
-) -> str:
-    short_float = parse_metric_number(fundamentals.get("Short Float"))
-    float_shares = row.get("float_shares_outstanding_current")
-
-    notes = []
-    if float_shares is not None and not pd.isna(float_shares):
-        float_shares = float(float_shares)
-        if float_shares < 20_000_000:
-            notes.append("The lower float means the tape can overshoot the fundamental change intraday")
-        elif market_cap_desc == "large-cap":
-            notes.append("Because this is a larger cap, the move needs real sponsorship rather than just chat-room momentum")
-
-    if short_float is not None and short_float >= 12:
-        if direction == "positive":
-            notes.append("Elevated short interest adds squeeze fuel on top of genuine buying")
-        else:
-            notes.append("Elevated short interest can soften the downside later if shorts start harvesting gains")
-    elif short_float is not None and short_float <= 3 and direction == "positive":
-        notes.append("The move will need fresh longs because there is not much short-covering fuel behind it")
-
-    if not notes:
+def safe_text(value: Any) -> str:
+    if value is None:
         return ""
-    return ". ".join(notes) + "."
-
-
-def build_durability_note(
-    event_label: str,
-    direction: str,
-    quality_bucket: str,
-    grade: str,
-    fundamentals: dict[str, Any],
-) -> str:
-    debt_eq = parse_metric_number(fundamentals.get("Debt/Eq"))
-    cash_sh = parse_metric_number(fundamentals.get("Cash/sh"))
-
-    if direction == "positive":
-        if event_label in {"Commercial", "Product"} and quality_bucket in {"weak", "speculative-growth", "mixed"}:
-            return (
-                "Durability now depends on whether traders believe this headline can turn into signed revenue or a real estimate revision; otherwise it behaves like attention without conversion."
-            )
-        if event_label == "M&A":
-            return (
-                "If deal terms and closing odds look clean, upside should start trading off transaction math instead of pure momentum, which usually makes the move more orderly but less open-ended."
-            )
-        if event_label == "Clinical":
-            return (
-                "Durability depends on whether the market reads this as reducing future financing risk and increasing commercialization odds, not just as a one-session biotech headline."
-            )
-        if quality_bucket == "quality":
-            return (
-                "Because the business already had real operating quality, the bar for holding gains is lower: the market only needs to believe the catalyst meaningfully improves the next few quarters."
-            )
-        if grade == "C":
-            return (
-                "Because this is landing on a previously weak chart, the stock still has to prove the move is a regime change and not just trapped shorts plus first-hour momentum."
-            )
-        return (
-            "Durability depends on whether buyers start underwriting higher forward numbers rather than just paying up for the first reaction."
-        )
-
-    if event_label == "Financing":
-        return (
-            "The real question is whether the added runway outweighs the hit to per-share value; if not, the market will keep treating rallies as exits."
-        )
-    if event_label == "Legal":
-        return (
-            "Until the liability and operating impact are quantifiable, investors usually demand a lower multiple, so stabilization tends to lag the first headline."
-        )
-    if quality_bucket in {"quality", "profitable"} and ((debt_eq is None or debt_eq < 0.7) or (cash_sh is not None and cash_sh > 1)):
-        return (
-            "Stronger underlying fundamentals can eventually attract dip buyers, but usually only after the market has fully repriced the new risk."
-        )
-    return (
-        "With weaker underlying support, the market does not have much reason to defend the old valuation until a new floor is discovered."
-    )
-
-
-def build_what_changes(
-    row: dict[str, Any],
-    event_label: str,
-    direction: str,
-    grade: str,
-    gap_pct: float,
-    volume_note: str,
-    fundamentals: dict[str, Any],
-) -> str:
-    market_cap_num = parse_metric_number(fundamentals.get("Market Cap"))
-    market_cap_desc = get_market_cap_descriptor(market_cap_num)
-    quality_bucket = get_fundamental_quality_bucket(fundamentals)
-    from_frame, to_frame = build_repricing_frame(event_label, direction, grade)
-    positioning_note = build_positioning_note(row, fundamentals, direction, market_cap_desc)
-    durability_note = build_durability_note(event_label, direction, quality_bucket, grade, fundamentals)
-    gap_side = "gap-up" if gap_pct >= 0 else "gap-down"
-
-    opening_sentence = (
-        f"The market is reframing this {market_cap_desc} {gap_side} from {from_frame} to {to_frame}."
-    )
-    parts = [opening_sentence]
-    if positioning_note:
-        parts.append(positioning_note)
-    parts.append(durability_note)
-    parts.append(volume_note)
-    return " ".join(parts)
-
-
-def build_ai_reasoning(
-    row: dict[str, Any],
-    news_payload: dict[str, Any],
-    volume_ratio: float | None,
-    is_volume_breaker: bool,
-) -> dict[str, str]:
-    ticker = row["ticker"]
-    headlines = news_payload.get("headlines", [])
-    primary = clean_headline(headlines[0]["title"], ticker) if headlines else ""
-    event_label, direction = classify_headline(primary) if primary else ("Headline", "mixed")
-    descriptor = get_company_descriptor(ticker, news_payload.get("industry"), news_payload.get("sector"))
-    float_note = get_float_descriptor(row.get("float_shares_outstanding_current"))
-    fundamentals = news_payload.get("fundamentals", {})
-    grade = compute_grade(row.get("display_price"), row.get("EMA10"), row.get("EMA20"), row.get("SMA50"))
-    gap_pct = float(row.get("premarket_change") or 0.0)
-    gap_side = "gap-up" if gap_pct >= 0 else "gap-down"
-
-    if grade == "A":
-        before = f"{descriptor} was already in a clean uptrend above EMA10, EMA20, and SMA50 with {float_note}."
-    elif grade == "C":
-        before = f"{descriptor} was under pressure below its key trend averages, so the chart was weak even before today's catalyst hit."
-    else:
-        before = f"{descriptor} was in a mixed or basing structure without full trend confirmation, with {float_note}."
-
-    if primary:
-        news_hit = f"{event_label} catalyst. {primary}."
-    else:
-        news_hit = "No fresh Finviz headline is showing, so the move may be reacting to older information or pure order flow."
-
-    fundamental_change = build_fundamental_change(event_label, direction, fundamentals, primary)
-
-    if volume_ratio is None:
-        volume_note = "Volume confirmation is still developing."
-    elif is_volume_breaker:
-        volume_note = (
-            f"Premarket volume is already {volume_ratio:.2f}x of the stock's all-time daily record, "
-            "so this is becoming a full tape reset rather than a normal headline spike."
-        )
-    elif volume_ratio >= 0.4:
-        volume_note = (
-            f"Premarket volume is already {volume_ratio:.2f}x of the stock's all-time daily record, "
-            "which is strong enough to keep momentum traders involved if price holds."
-        )
-    else:
-        volume_note = (
-            f"Premarket volume is only {volume_ratio:.2f}x of the all-time daily record, "
-            "so the move still needs follow-through after the open."
-        )
-
-    change = build_what_changes(
-        row=row,
-        event_label=event_label,
-        direction=direction,
-        grade=grade,
-        gap_pct=gap_pct,
-        volume_note=volume_note,
-        fundamentals=fundamentals,
-    )
-
-    summary = (
-        f"AI view: {event_label} catalyst driving a {abs(gap_pct):.1f}% {gap_side}; "
-        f"{'high-conviction volume' if is_volume_breaker else 'watch for hold above the open'}."
-    )
-    return {
-        "summary": summary,
-        "before": before,
-        "news_hit": news_hit,
-        "fundamental_change": fundamental_change,
-        "what_changes": change,
-    }
-
-
-@st.cache_data(ttl=5 * 60, show_spinner=False)
-def llm_catalyst_analysis(
-    ticker: str,
-    sector: str,
-    industry: str,
-    market_cap: str,
-    short_float_str: str,
-    float_str: str,
-    price_str: str,
-    eps_qq: str,
-    sales_qq: str,
-    gross_margin: str,
-    inst_own: str,
-    insider_own: str,
-    target_price: str,
-    gap_pct: float,
-    volume_ratio_str: str,
-    is_volume_breaker: bool,
-    grade: str,
-    headline_1: str,
-    headline_2: str,
-) -> dict[str, Any]:
-    """
-    Comprehensive 14-field analyst breakdown via Claude Sonnet.
-    Covers: why today, story before/after, mechanism, float analysis,
-    bull/bear cases, key uncertainty, catalyst durability, dilution risk,
-    trade structure, entry thesis, invalidation, and re-rating verdict.
-    """
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        try:
-            api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-        except Exception:
-            pass
-    if not api_key:
-        return {}
-
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-
-        sf_note = ""
-        if short_float_str:
-            try:
-                sf_val = float(short_float_str.replace("%", "").strip())
-                if sf_val >= 30:
-                    sf_note = "  ← VERY HIGH — forced-covering dynamics almost certain"
-                elif sf_val >= 20:
-                    sf_note = "  ← HIGH — squeeze risk present, monitor covering pressure"
-                elif sf_val >= 10:
-                    sf_note = "  ← Elevated — short covering adds buying pressure"
-            except ValueError:
-                pass
-
-        ctx_lines = [
-            f"Ticker: {ticker}",
-            f"Sector / Industry: {sector or 'Unknown'} / {industry or 'Unknown'}",
-            f"Current price: {price_str}" if price_str else None,
-            f"Market cap: {market_cap}" if market_cap else None,
-            f"Public float: {float_str}" if float_str else None,
-            f"Short float: {short_float_str}{sf_note}" if short_float_str else None,
-            f"Institutional ownership: {inst_own}" if inst_own else None,
-            f"Insider ownership: {insider_own}" if insider_own else None,
-            f"Analyst consensus target: {target_price}" if target_price else None,
-            f"EPS Q/Q growth: {eps_qq}" if eps_qq else None,
-            f"Sales Q/Q growth: {sales_qq}" if sales_qq else None,
-            f"Gross margin: {gross_margin}" if gross_margin else None,
-            f"Trend grade: {grade}  (A = EMA10>EMA20>SMA50 uptrend / B = mixed / C = downtrend)",
-        ]
-        ctx_block = "\n".join(c for c in ctx_lines if c)
-
-        vol_lines = [
-            f"Premarket gap: {gap_pct:+.2f}%",
-            f"Volume vs all-time daily high: {volume_ratio_str}" if volume_ratio_str else None,
-            "⚠ EXTREME TAPE — premarket volume is at or near the all-time daily record for this ticker." if is_volume_breaker else None,
-        ]
-        vol_block = "\n".join(v for v in vol_lines if v)
-
-        hl_lines = [f"1. {headline_1}" if headline_1 else None,
-                    f"2. {headline_2}" if headline_2 else None]
-        headlines_block = "\n".join(h for h in hl_lines if h) or "No headlines available."
-
-        prompt = f"""You are the lead analyst at a US prop trading desk. A stock just gapped premarket. Every trader on the desk is reading your analysis right now, before the open. Be specific. Be quantitative. No filler. Every sentence must justify its existence.
-
-=== STOCK PROFILE ===
-{ctx_block}
-
-=== TAPE & VOLUME ===
-{vol_block}
-
-=== CATALYST HEADLINES ===
-{headlines_block}
-
-=== YOUR ANALYSIS — respond ONLY with valid JSON, no markdown fences, no preamble ===
-{{
-  "catalyst_quality": "High | Medium | Low",
-
-  "catalyst_quality_reason": "Why this quality tier? Reference the specific headline, this stock's setup (float, short interest, sector, fundamentals), and state explicitly whether this changes future cash flows or is just noise. Compare to a typical catalyst for a {sector or 'comparable'} stock of this size.",
-
-  "why_today": "What specifically triggered this gap TODAY? Connect the headline to the timing — earnings release, FDA calendar event, overnight news wire, analyst action, sector rotation, technical level break? If unclear or the headline is weak, say so explicitly.",
-
-  "story_before": "2 sentences. What was the prevailing market narrative about {ticker} BEFORE this headline? What were investors pricing in — broken business, turnaround attempt, speculative binary event, steady compounder?",
-
-  "story_after": "3-4 sentences. How does this headline change that narrative? What new mental model does the market need to adopt? Be specific about what gets repriced and why {ticker} deserves this reaction rather than peers in the sector.",
-
-  "mechanism": "Name the PRIMARY market mechanism and explain the mechanics with numbers. If short squeeze: approximate days-to-cover at current volume, and explain forced-covering dynamics. If institutional rerating: what estimate or multiple changes. If retail momentum on low-float: explain supply/demand math. If sector sympathy: why was this name picked up and not peers. Use actual numbers from the profile above.",
-
-  "float_analysis": "Deep analysis of the float in context of this specific move. For small float (<10M shares): explain the volatility math — buying pressure per share of float, what that means for move sustainability vs snap-back risk, and whether today's gap has already exhausted near-term float turnover. For larger floats: explain how float size limits or enables institutional participation in this move. Connect float explicitly to the gap magnitude ({gap_pct:+.2f}%) and the volume profile.",
-
-  "bullish": [
-    "Most important bull argument — quantified, tied directly to the actual news and this ticker's specific numbers",
-    "Second bull argument — structural setup (float, short interest, trend grade) that amplifies the catalyst",
-    "Third bull argument — a separate angle not already covered",
-    "Fourth if genuinely distinct and strong",
-    "Fifth only if there is a clearly separate fifth argument"
-  ],
-
-  "bearish": [
-    "Most important bear risk — specific to this news and this stock's situation, not generic market risk",
-    "Dilution/offering risk assessment — for micro/small caps: has this stock historically offered stock post-gap? Is a follow-on offering likely given the gap size and capital needs?",
-    "Third specific bear risk",
-    "Fourth if clearly present and distinct from the above"
-  ],
-
-  "key_uncertainty": "The SINGLE most important unknown that could make either bulls or bears completely wrong. This is the crux of the trade. If resolved bullishly, what changes? If resolved bearishly, what changes? Name it specifically.",
-
-  "catalyst_durability": "Hours | 1-3 Days | 1-2 Weeks | Multi-week",
-
-  "catalyst_durability_reason": "Why that duration? Name specifically what would extend it (follow-up catalyst, earnings revision cycle, FDA approval timeline) and what would cut it short (offering announcement, sector rotation, no follow-through on fundamentals).",
-
-  "dilution_risk": "Specific assessment of secondary offering / ATM share sale risk. Consider market cap ({market_cap or 'unknown'}), gap magnitude ({gap_pct:+.2f}% — larger gaps create more incentive to raise), institutional ownership, and whether this stock type typically uses gaps as financing windows. Give a clear risk level (Low / Medium / High) with specific rationale. If mid/large-cap with strong balance sheet, state N/A and briefly why.",
-
-  "trade_structure": "Gap-and-Go | Gap-and-Fade | Multi-Day Setup | Too Early to Call",
-
-  "trade_structure_reason": "Reasoning using ALL available data: float size, short interest level, catalyst durability, volume character vs ATH, gap magnitude, and whether this type of catalyst in this sector historically sustains or fades intraday.",
-
-  "entry_thesis": "When and how would a disciplined trader enter? Specify: what price action confirmation, what volume pattern, what time window, and what level. e.g. 'First 5-min candle close above the open on volume >2x the prior 5-min average' or 'Pullback to VWAP with a higher-low reversal candle in the first 30 minutes, with volume drying up on the flush.'",
-
-  "invalidation": "What SPECIFIC price action, volume pattern, or news development invalidates the bull thesis? Name exact signals — e.g. 'Break below the opening 5-min candle low on heavy volume', 'Secondary offering announcement', 'Volume dries up below VWAP within first 15 minutes.' Not vague warnings.",
-
-  "rerating": "Yes | Partial | No",
-
-  "rerating_reason": "Does this force sell-side estimate revisions, change the valuation multiple, or reclassify the stock's risk profile? Or is it a sentiment event that fades when the news cycle moves on? Specify exactly what changes in the valuation framework, over what time horizon, and what evidence would confirm the re-rating is sticking."
-}}
-
-NON-NEGOTIABLE:
-1. Every single field must be specific to {ticker} and this exact news. If it could apply to any other stock, rewrite it.
-2. Use the actual numbers from the profile (float, short float %, market cap, gap %, EPS, etc.) throughout.
-3. No hedging phrases. No "time will tell." No "investors should monitor." If you don't know, say you don't know.
-4. bullish and bearish must be plain string arrays only.
-5. Aim for maximum informational density — every word earns its place."""
-
-        message = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=2500,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = message.content[0].text.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        parsed = json.loads(raw)
-
-        return {
-            "catalyst_quality":           str(parsed.get("catalyst_quality", "")).strip(),
-            "catalyst_quality_reason":    str(parsed.get("catalyst_quality_reason", "")).strip(),
-            "why_today":                  str(parsed.get("why_today", "")).strip(),
-            "story_before":               str(parsed.get("story_before", "")).strip(),
-            "story_after":                str(parsed.get("story_after", "")).strip(),
-            "mechanism":                  str(parsed.get("mechanism", "")).strip(),
-            "float_analysis":             str(parsed.get("float_analysis", "")).strip(),
-            "bullish":                    [str(p) for p in parsed.get("bullish", [])],
-            "bearish":                    [str(p) for p in parsed.get("bearish", [])],
-            "key_uncertainty":            str(parsed.get("key_uncertainty", "")).strip(),
-            "catalyst_durability":        str(parsed.get("catalyst_durability", "")).strip(),
-            "catalyst_durability_reason": str(parsed.get("catalyst_durability_reason", "")).strip(),
-            "dilution_risk":              str(parsed.get("dilution_risk", "")).strip(),
-            "trade_structure":            str(parsed.get("trade_structure", "")).strip(),
-            "trade_structure_reason":     str(parsed.get("trade_structure_reason", "")).strip(),
-            "entry_thesis":               str(parsed.get("entry_thesis", "")).strip(),
-            "invalidation":               str(parsed.get("invalidation", "")).strip(),
-            "rerating":                   str(parsed.get("rerating", "")).strip(),
-            "rerating_reason":            str(parsed.get("rerating_reason", "")).strip(),
-        }
-    except Exception as e:
-        st.session_state["llm_last_error"] = f"{ticker}: {type(e).__name__}: {e}"
-        return {}
-
-
-def build_trade_edge(
-    event_label: str,
-    direction: str,
-    short_float: float | None,
-    quality_bucket: str,
-    grade: str,
-    gap_pct: float,
-    volume_ratio: float | None,
-    is_volume_breaker: bool,
-) -> str:
-    """One punchy, specific sentence describing the trade setup."""
-    float_squeeze = short_float is not None and short_float > 20
-    vol_confirmed = is_volume_breaker or (volume_ratio is not None and volume_ratio >= 0.4)
-
-    if event_label == "M&A":
-        if direction == "positive":
-            if float_squeeze:
-                return f"Deal math sets a hard floor; {short_float:.1f}% short adds squeeze fuel if arbs pile in."
-            return "Deal math sets a hard floor; upside limited to premium unless a competing bid emerges."
-        return "Deal collapse — binary gap-down; watch for support at pre-announcement price."
-
-    if event_label == "Clinical":
-        if direction == "positive":
-            if float_squeeze:
-                return f"Positive data + {short_float:.1f}% short = squeeze on top of science; fades fast if volume dries."
-            return "Hold durability depends on data depth, not just the headline — watch 30-min volume trend."
-        return "Failed trial/FDA rejection — commercialization odds repriced; expect continued distribution."
-
-    if event_label == "Earnings":
-        if direction == "positive":
-            if quality_bucket in ("quality", "profitable"):
-                return "Beat on a profitable name — multiple expansion more likely; watch whether buy-side adds on dips."
-            if float_squeeze:
-                return f"Earnings pop + {short_float:.1f}% short — could turn into a squeeze; fade risk high if guidance is thin."
-            return "Earnings beat on a spec name — sell-the-news risk if guidance doesn't support the gap."
-        if direction == "negative":
-            return "Miss — forward estimates need resetting; selling pressure typically extends past the first session."
-        return "Mixed print — market parsing guidance vs beat/miss; expect choppy two-way price action."
-
-    if event_label == "Commercial":
-        if float_squeeze:
-            return f"Contract/deal + {short_float:.1f}% short — news + squeeze potential; key is whether revenue terms are disclosed."
-        return "Commercial deal: durable if contract size is material to revenue; fades if details stay vague."
-
-    if event_label == "Financing":
-        if direction == "negative":
-            return "Dilutive offering — downside tied to deal size vs market cap; overhang persists until fully placed."
-        return "Financing removes survival risk but shifts narrative to dilution math and burn rate."
-
-    if event_label == "Analyst":
-        if direction == "positive":
-            return "Upgrade/PT raise — watch for institutional follow-through; retail-only moves fade by midday."
-        return "Downgrade/PT cut — new PT becomes near-term resistance; gap-fill attempts likely cap out there."
-
-    if event_label == "Legal":
-        return "Legal catalyst — discount applied until liability size is quantifiable; avoid catching falling knives."
-
-    if event_label == "Product":
-        if quality_bucket in ("quality", "profitable"):
-            return "Product launch on a profitable business — TAM expansion story has an earnings foundation."
-        return "Pre-revenue product launch — narrative catalyst; watch 30-min VWAP for momentum durability."
-
-    # Generic fallback
-    if float_squeeze and is_volume_breaker:
-        return f"{short_float:.1f}% short + near-record volume — high-risk momentum setup in both directions."
-    if float_squeeze:
-        return f"{short_float:.1f}% short float elevates squeeze risk above the catalyst itself."
-    if grade == "A" and vol_confirmed:
-        return "Clean uptrend + volume confirmed — lowest-resistance path is continuation; watch first pullback hold."
-    if grade == "C":
-        return "Gap on a downtrending chart — fade risk elevated; needs VWAP hold into midday to shift bias."
-    return "Watch for volume confirmation at the open before committing to direction."
-
-
-def build_trade_context(
-    row: dict[str, Any],
-    news_payload: dict[str, Any],
-    volume_ratio: float | None,
-    is_volume_breaker: bool,
-) -> dict[str, Any]:
-    ticker = row["ticker"]
-    headlines = news_payload.get("headlines", [])
-    primary = clean_headline(headlines[0]["title"], ticker) if headlines else ""
-    secondary = clean_headline(headlines[1]["title"], ticker) if len(headlines) > 1 else ""
-    event_label, direction = classify_headline(primary) if primary else ("Headline", "mixed")
-    fundamentals = news_payload.get("fundamentals", {})
-    grade = compute_grade(row.get("display_price"), row.get("EMA10"), row.get("EMA20"), row.get("SMA50"))
-    gap_pct = float(row.get("premarket_change") or 0.0)
-    quality_bucket = get_fundamental_quality_bucket(fundamentals)
-
-    # Core identifiers / sizing
-    short_float = parse_metric_number(fundamentals.get("Short Float"))
-    short_float_str = f"{short_float:.1f}%" if short_float is not None else ""
-    market_cap = clean_metric(fundamentals.get("Market Cap")) or ""
-    sector = str(news_payload.get("sector") or "").strip()
-    industry = str(news_payload.get("industry") or "").strip()
-
-    # Float and price for LLM context
-    float_shares = row.get("float_shares_outstanding_current")
-    float_str = compact_number(float_shares, " shares") if float_shares and not pd.isna(float_shares) else ""
-    price = row.get("display_price")
-    price_str = format_price(price) if price and not pd.isna(price) else ""
-
-    # Volume context
-    volume_ratio_str = f"{volume_ratio:.2f}x all-time high" if volume_ratio is not None else ""
-
-    # Fundamentals
-    eps_qq = clean_metric(fundamentals.get("EPS Q/Q")) or ""
-    sales_qq = clean_metric(fundamentals.get("Sales Q/Q")) or ""
-    gross_margin = clean_metric(fundamentals.get("Gross Margin")) or ""
-    inst_own = clean_metric(fundamentals.get("Inst Own")) or ""
-    insider_own = clean_metric(fundamentals.get("Insider Own")) or ""
-    target_price = clean_metric(fundamentals.get("Target Price")) or ""
-
-    # Fallback edge sentence (used when no API key)
-    edge = build_trade_edge(
-        event_label=event_label,
-        direction=direction,
-        short_float=short_float,
-        quality_bucket=quality_bucket,
-        grade=grade,
-        gap_pct=gap_pct,
-        volume_ratio=volume_ratio,
-        is_volume_breaker=is_volume_breaker,
-    )
-
-    # LLM analyst breakdown — requires ANTHROPIC_API_KEY env var
-    llm = llm_catalyst_analysis(
-        ticker=ticker,
-        sector=sector,
-        industry=industry,
-        market_cap=market_cap,
-        short_float_str=short_float_str,
-        float_str=float_str,
-        price_str=price_str,
-        eps_qq=eps_qq,
-        sales_qq=sales_qq,
-        gross_margin=gross_margin,
-        inst_own=inst_own,
-        insider_own=insider_own,
-        target_price=target_price,
-        gap_pct=gap_pct,
-        volume_ratio_str=volume_ratio_str,
-        is_volume_breaker=is_volume_breaker,
-        grade=grade,
-        headline_1=primary,
-        headline_2=secondary,
-    )
-
-    catalyst_summary = f"[{event_label}] {primary}" if primary else f"[{event_label}] No headline."
-    return {
-        "event_label": event_label,
-        "direction": direction,
-        "headlines": headlines,
-        "short_float_str": short_float_str or None,
-        "market_cap": market_cap or None,
-        "sector": sector,
-        "edge": edge,
-        "catalyst_summary": catalyst_summary,
-        # LLM fields (empty dict / defaults if no API key)
-        "catalyst_quality":           llm.get("catalyst_quality", ""),
-        "catalyst_quality_reason":    llm.get("catalyst_quality_reason", ""),
-        "why_today":                  llm.get("why_today", ""),
-        "story_before":               llm.get("story_before", ""),
-        "story_after":                llm.get("story_after", ""),
-        "mechanism":                  llm.get("mechanism", ""),
-        "float_analysis":             llm.get("float_analysis", ""),
-        "bullish":                    llm.get("bullish", []),
-        "bearish":                    llm.get("bearish", []),
-        "key_uncertainty":            llm.get("key_uncertainty", ""),
-        "catalyst_durability":        llm.get("catalyst_durability", ""),
-        "catalyst_durability_reason": llm.get("catalyst_durability_reason", ""),
-        "dilution_risk":              llm.get("dilution_risk", ""),
-        "trade_structure":            llm.get("trade_structure", ""),
-        "trade_structure_reason":     llm.get("trade_structure_reason", ""),
-        "entry_thesis":               llm.get("entry_thesis", ""),
-        "invalidation":               llm.get("invalidation", ""),
-        "rerating":                   llm.get("rerating", ""),
-        "rerating_reason":            llm.get("rerating_reason", ""),
-    }
-
-
-def load_watchlist() -> list[dict[str, Any]]:
-    if not WATCHLIST_PATH.exists():
-        return []
-    try:
-        payload = json.loads(WATCHLIST_PATH.read_text(encoding="utf-8"))
-        if isinstance(payload, list):
-            return payload
-    except (json.JSONDecodeError, OSError):
-        pass
-    return []
-
-
-def save_watchlist(items: list[dict[str, Any]]) -> None:
-    deduped: dict[str, dict[str, Any]] = {}
-    for item in items:
-        ticker = str(item.get("ticker", "")).upper().strip()
-        if ticker:
-            deduped[ticker] = {**item, "ticker": ticker}
-    sorted_items = sorted(
-        deduped.values(),
-        key=lambda item: item.get("timestamp", ""),
-        reverse=True,
-    )
-    WATCHLIST_PATH.write_text(json.dumps(sorted_items, indent=2), encoding="utf-8")
-
-
-def add_watchlist_item(
-    ticker: str,
-    catalyst: str,
-    price: float | None,
-    gap_pct: float | None,
-    source: str,
-) -> bool:
-    items = load_watchlist()
-    by_ticker = {item["ticker"]: item for item in items if "ticker" in item}
-    normalized = ticker.upper().strip()
-    exists = normalized in by_ticker
-    if exists and source == "auto-volume-breaker":
-        return False
-    by_ticker[normalized] = {
-        "ticker": normalized,
-        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "catalyst": catalyst,
-        "price": price,
-        "gap_pct": gap_pct,
-        "source": source,
-    }
-    save_watchlist(list(by_ticker.values()))
-    return not exists
-
-
-def remove_watchlist_item(ticker: str) -> None:
-    remaining = [item for item in load_watchlist() if item.get("ticker") != ticker]
-    save_watchlist(remaining)
-
-
-def export_watchlist_csv(items: list[dict[str, Any]]) -> bytes:
-    if not items:
-        return b"ticker,timestamp,catalyst,price,gap_pct,source\n"
-    frame = pd.DataFrame(items)
-    return frame.to_csv(index=False).encode("utf-8")
+    return str(value).strip()
 
 
 def tradingview_request_kwargs() -> dict[str, Any]:
@@ -1631,180 +579,1828 @@ def tradingview_request_kwargs() -> dict[str, Any]:
     return {"cookies": cookies}
 
 
-@st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
-def fetch_all_time_high_volume(ticker: str) -> dict[str, Any]:
-    try:
-        history = yf.Ticker(ticker).history(period="max", auto_adjust=False)
-        if history.empty or "Volume" not in history.columns:
-            return {"all_time_high_volume": None}
-        volumes = pd.to_numeric(history["Volume"], errors="coerce").dropna()
-        if volumes.empty:
-            return {"all_time_high_volume": None}
-        return {"all_time_high_volume": int(volumes.max())}
-    except Exception as exc:  # pragma: no cover
-        return {"all_time_high_volume": None, "error": str(exc)}
+def unique_watchlist_urls() -> list[str]:
+    raw = os.getenv("TRADINGVIEW_WATCHLIST_URLS", "").strip()
+    urls = [item.strip() for item in raw.splitlines() if item.strip()] if raw else DEFAULT_SHARED_WATCHLIST_URLS
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            deduped.append(url)
+    return deduped
 
 
-@st.cache_data(ttl=5 * 60, show_spinner=False)
-def fetch_news_bundle(ticker: str) -> dict[str, Any]:
-    try:
-        quote = finvizfinance(ticker)
-        fundamentals = quote.ticker_fundament(raw=True, output_format="dict")
-        description = quote.ticker_description()
-        news = quote.ticker_news()
-        base_payload = {
-            "company": fundamentals.get("Company"),
-            "sector": fundamentals.get("Sector"),
-            "industry": fundamentals.get("Industry"),
-            "description": description,
-            "fundamentals": {
-                "Market Cap": fundamentals.get("Market Cap"),
-                "Shs Outstand": fundamentals.get("Shs Outstand"),
-                "Short Float": fundamentals.get("Short Float"),
-                "P/E": fundamentals.get("P/E"),
-                "Forward P/E": fundamentals.get("Forward P/E"),
-                "EPS next Y": fundamentals.get("EPS next Y"),
-                "EPS next Y Percentage": fundamentals.get("EPS next Y Percentage"),
-                "EPS Q/Q": fundamentals.get("EPS Q/Q"),
-                "Sales Q/Q": fundamentals.get("Sales Q/Q"),
-                "ROA": fundamentals.get("ROA"),
-                "ROE": fundamentals.get("ROE"),
-                "Gross Margin": fundamentals.get("Gross Margin"),
-                "Oper. Margin": fundamentals.get("Oper. Margin"),
-                "Profit Margin": fundamentals.get("Profit Margin"),
-                "Debt/Eq": fundamentals.get("Debt/Eq"),
-                "Cash/sh": fundamentals.get("Cash/sh"),
-                "Book/sh": fundamentals.get("Book/sh"),
-                "Inst Own": fundamentals.get("Inst Own"),
-                "Insider Own": fundamentals.get("Insider Own"),
-                "Target Price": fundamentals.get("Target Price"),
+def watchlist_id_from_url(url: str) -> str:
+    match = re.search(r"/watchlists/(\d+)/", url)
+    if match:
+        return f"watchlist-{match.group(1)}"
+    return f"watchlist-{abs(hash(url))}"
+
+
+def parse_watchlist_payload(html: str) -> dict[str, Any]:
+    match = re.search(r'<script type="application/prs.init-data\+json">(.*?)</script>', html, re.S)
+    if not match:
+        raise ValueError("TradingView watchlist payload was not found in the page.")
+    payload = json.loads(match.group(1))
+    shared_watchlist = payload.get("sharedWatchlist", {})
+    watchlist = shared_watchlist.get("list")
+    if not watchlist:
+        raise ValueError("TradingView page did not expose a shared watchlist payload.")
+    return {"watchlist": watchlist, "author": shared_watchlist.get("author", {})}
+
+
+def fetch_watchlist_definition(url: str) -> dict[str, Any]:
+    cache_key = url.strip()
+    with WATCHLIST_CACHE_LOCK:
+        cached = WATCHLIST_CACHE.get(cache_key)
+        if cached:
+            return cached
+
+    response = requests.get(url, headers=WATCHLIST_HTTP_HEADERS, timeout=30)
+    response.raise_for_status()
+    payload = parse_watchlist_payload(response.text)
+    watchlist = payload["watchlist"]
+    symbols = [safe_text(symbol) for symbol in watchlist.get("symbols", []) if safe_text(symbol)]
+    board = {
+        "id": watchlist_id_from_url(url),
+        "kind": "watchlist",
+        "title": safe_text(watchlist.get("name")) or watchlist_id_from_url(url),
+        "description": f"{len(symbols)} symbols from TradingView shared watchlist",
+        "url": url,
+        "symbols": symbols,
+        "symbol_count": len(symbols),
+        "watchlist_id": watchlist.get("id"),
+    }
+    with WATCHLIST_CACHE_LOCK:
+        WATCHLIST_CACHE[cache_key] = board
+    return board
+
+
+def get_board_definitions() -> list[dict[str, Any]]:
+    global BOARD_DEFINITIONS_CACHE
+    with BOARD_DEFINITIONS_LOCK:
+        if BOARD_DEFINITIONS_CACHE is not None:
+            return BOARD_DEFINITIONS_CACHE
+
+        boards: list[dict[str, Any]] = [
+            {
+                "id": "premarket",
+                "kind": "premarket",
+                "title": "Premarket Gappers",
+                "description": "TradingView premarket scan with Finviz news and catalyst grading",
+                "symbol_count": 0,
             },
-        }
-        if news is None or news.empty:
-            return {**base_payload, "summary": "No fresh catalyst pulled from Finviz.", "headlines": []}
+            {
+                "id": "market-brief",
+                "kind": "market-brief",
+                "title": "Market Brief",
+                "description": "Macro and sector briefs across your watchlists",
+                "symbol_count": 0,
+            }
+        ]
 
-        headlines = []
-        for row in news.head(2).itertuples(index=False):
-            dt_value = getattr(row, "Date", None)
-            dt_text = dt_value.strftime("%b %d %I:%M %p") if hasattr(dt_value, "strftime") else str(dt_value)
-            headlines.append(
-                {
-                    "time": dt_text,
-                    "title": str(getattr(row, "Title", "")),
-                    "link": str(getattr(row, "Link", "")),
-                    "source": str(getattr(row, "Source", "")),
-                }
+        for url in unique_watchlist_urls():
+            try:
+                boards.append(fetch_watchlist_definition(url))
+            except Exception as exc:
+                boards.append(
+                    {
+                        "id": watchlist_id_from_url(url),
+                        "kind": "watchlist",
+                        "title": watchlist_id_from_url(url),
+                        "description": f"Failed to load watchlist metadata: {exc}",
+                        "url": url,
+                        "symbols": [],
+                        "symbol_count": 0,
+                        "load_error": str(exc),
+                    }
+                )
+
+        BOARD_DEFINITIONS_CACHE = boards
+        return BOARD_DEFINITIONS_CACHE
+
+
+def get_board_definition(board_id: str) -> dict[str, Any]:
+    for board in get_board_definitions():
+        if board["id"] == board_id:
+            return board
+    return get_board_definitions()[0]
+
+
+def get_cell_value(record: dict[str, Any], *keys: str) -> Any:
+    lowered = {str(key).lower(): value for key, value in record.items()}
+    for key in keys:
+        if key in record:
+            return record[key]
+        lowered_key = key.lower()
+        if lowered_key in lowered:
+            return lowered[lowered_key]
+    return None
+
+
+def normalize_news_frame(news_frame: Any) -> list[dict[str, str]]:
+    if news_frame is None or not isinstance(news_frame, pd.DataFrame) or news_frame.empty:
+        return []
+
+    items: list[dict[str, str]] = []
+    trimmed = news_frame.head(5).copy()
+    for _, row in trimmed.iterrows():
+        record = row.to_dict()
+        date_value = get_cell_value(record, "Date", "date")
+        title = safe_text(get_cell_value(record, "Title", "title"))
+        link = safe_text(get_cell_value(record, "Link", "link", "URL", "url"))
+        source = safe_text(get_cell_value(record, "Source", "source"))
+        if not title:
+            continue
+
+        published_at = parse_news_timestamp(date_value)
+        if published_at is not None:
+            date_text = published_at.strftime("%b %d %I:%M %p")
+            published_iso = published_at.isoformat()
+        elif hasattr(date_value, "strftime"):
+            date_text = date_value.strftime("%b %d %I:%M %p")
+            published_iso = ""
+        else:
+            date_text = safe_text(date_value)
+            published_iso = ""
+
+        items.append({"time": date_text, "published_at": published_iso, "title": title, "source": source, "url": link})
+    return items
+
+
+def normalize_yfinance_news(news_items: Any) -> list[dict[str, str]]:
+    if not isinstance(news_items, list):
+        return []
+
+    normalized: list[dict[str, str]] = []
+    for item in news_items[:MAX_YFINANCE_NEWS_ITEMS]:
+        content = item.get("content") or {}
+        content_type = safe_text(content.get("contentType")).upper()
+        if content_type and content_type not in {"STORY", "ARTICLE"}:
+            continue
+
+        title = clean_headline_text(content.get("title", ""))
+        if not title:
+            continue
+
+        provider = content.get("provider") or {}
+        source = safe_text(provider.get("displayName")) or safe_text(item.get("publisher")) or "Yahoo Finance"
+        url = safe_text((content.get("clickThroughUrl") or {}).get("url")) or safe_text((content.get("canonicalUrl") or {}).get("url"))
+        published_at = parse_news_timestamp(content.get("pubDate"))
+        time_text = published_at.strftime("%b %d %I:%M %p") if published_at is not None else safe_text(content.get("displayTime"))
+        normalized.append(
+            {
+                "time": time_text,
+                "published_at": published_at.isoformat() if published_at is not None else "",
+                "title": title,
+                "source": source,
+                "url": url,
+            }
+        )
+    return normalized
+
+
+def news_dedupe_key(item: dict[str, str]) -> str:
+    title_key = re.sub(r"[^a-z0-9]+", "", clean_headline_text(item.get("title", "")).lower())
+    if title_key:
+        return f"title:{title_key}"
+    url_key = safe_text(item.get("url", "")).strip().lower()
+    return f"url:{url_key}"
+
+
+def merge_news_items(*collections: list[dict[str, str]]) -> list[dict[str, str]]:
+    merged: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    all_items: list[dict[str, str]] = []
+    for collection in collections:
+        all_items.extend(collection or [])
+
+    def sort_key(item: dict[str, str]) -> tuple[float, str]:
+        published_at = parse_news_timestamp(item.get("published_at") or item.get("time"))
+        published_epoch = published_at.timestamp() if published_at is not None else 0.0
+        return (published_epoch, clean_headline_text(item.get("title", "")).lower())
+
+    for item in sorted(all_items, key=sort_key, reverse=True):
+        dedupe_key = news_dedupe_key(item)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        merged.append(item)
+
+    return merged[:MAX_MERGED_NEWS_ITEMS]
+
+
+def fetch_yfinance_news_items(ticker: str) -> list[dict[str, str]]:
+    try:
+        return normalize_yfinance_news(yf.Ticker(ticker).get_news(count=MAX_YFINANCE_NEWS_ITEMS))
+    except Exception:
+        return []
+
+
+def infer_category_from_news(news_items: list[dict[str, str]]) -> str:
+    if not news_items:
+        return "No Fresh News"
+
+    combined = " ".join(item["title"] for item in news_items).lower()
+    keyword_map = [
+        ("fda", "FDA / Clinical"),
+        ("phase", "FDA / Clinical"),
+        ("trial", "FDA / Clinical"),
+        ("clinical", "FDA / Clinical"),
+        ("earnings", "Earnings"),
+        ("guidance", "Earnings"),
+        ("eps", "Earnings"),
+        ("revenue", "Earnings"),
+        ("public offering", "Financing / Offering"),
+        ("registered direct", "Financing / Offering"),
+        ("private placement", "Financing / Offering"),
+        ("offering", "Financing / Offering"),
+        ("pricing", "Financing / Offering"),
+        ("acquire", "M&A / Rumor"),
+        ("merger", "M&A / Rumor"),
+        ("buyout", "M&A / Rumor"),
+        ("rumor", "M&A / Rumor"),
+        ("upgrade", "Analyst / Upgrade"),
+        ("initiates", "Analyst / Upgrade"),
+        ("price target", "Analyst / Upgrade"),
+        ("contract", "PR / Contract"),
+        ("order", "PR / Contract"),
+        ("partnership", "PR / Contract"),
+        ("agreement", "PR / Contract"),
+        ("sector", "Sympathy / Sector"),
+        ("peer", "Sympathy / Sector"),
+    ]
+    for needle, category in keyword_map:
+        if needle in combined:
+            return category
+    return "Low Float Momentum"
+
+
+def clean_headline_text(text: str) -> str:
+    return re.sub(r"\s+", " ", safe_text(text)).strip()
+
+
+def shorten_text(text: str, limit: int = 88) -> str:
+    cleaned = clean_headline_text(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 3)].rstrip(". ,;:") + "..."
+
+
+MONTH_NAME_TO_NUMBER = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+HEADLINE_DATE_PATTERN = re.compile(
+    r"\b("
+    r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
+    r"Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+    r")\.?\s+(\d{1,2})(?:,\s*(\d{4}))?\b",
+    re.IGNORECASE,
+)
+
+
+def parse_news_timestamp(date_value: Any, reference: datetime | None = None) -> datetime | None:
+    if date_value is None:
+        return None
+
+    if reference is None:
+        reference = local_now()
+
+    if isinstance(date_value, datetime):
+        if date_value.tzinfo is None:
+            candidate = date_value.replace(tzinfo=LOCAL_TIMEZONE)
+        else:
+            candidate = date_value.astimezone(LOCAL_TIMEZONE)
+        return candidate
+
+    text = safe_text(date_value)
+    if not text:
+        return None
+
+    try:
+        iso_candidate = datetime.fromisoformat(text)
+    except ValueError:
+        iso_candidate = None
+    if iso_candidate is not None:
+        if iso_candidate.tzinfo is None:
+            return iso_candidate.replace(tzinfo=LOCAL_TIMEZONE)
+        return iso_candidate.astimezone(LOCAL_TIMEZONE)
+
+    for fmt in ("%b %d %I:%M %p", "%b-%d-%y %I:%M%p", "%b %d, %Y %I:%M %p", "%Y-%m-%d %H:%M:%S"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+        if "%Y" not in fmt and "%y" not in fmt:
+            parsed = parsed.replace(year=reference.year)
+            candidate = parsed.replace(tzinfo=LOCAL_TIMEZONE)
+            if candidate > reference + timedelta(days=45):
+                candidate = candidate.replace(year=candidate.year - 1)
+            return candidate
+
+        candidate = parsed.replace(tzinfo=LOCAL_TIMEZONE)
+        return candidate
+
+    return None
+
+
+def describe_relative_days(target: datetime | None, reference: datetime | None = None) -> str:
+    if target is None:
+        return ""
+    if reference is None:
+        reference = local_now()
+    day_delta = (target.date() - reference.date()).days
+    if day_delta == 0:
+        return "today"
+    if day_delta == -1:
+        return "1 day ago"
+    if day_delta == 1:
+        return "1 day ahead"
+    if day_delta < 0:
+        return f"{abs(day_delta)} days ago"
+    return f"{day_delta} days ahead"
+
+
+def extract_headline_dates(title: str, reference: datetime | None = None) -> list[datetime]:
+    if reference is None:
+        reference = local_now()
+    found_dates: list[datetime] = []
+    for match in HEADLINE_DATE_PATTERN.finditer(clean_headline_text(title)):
+        month_name, day_text, year_text = match.groups()
+        month = MONTH_NAME_TO_NUMBER.get(month_name.lower().rstrip("."))
+        if month is None:
+            continue
+        year = int(year_text) if year_text else reference.year
+        try:
+            candidate = datetime(year, month, int(day_text), tzinfo=LOCAL_TIMEZONE)
+        except ValueError:
+            continue
+        if not year_text and candidate > reference + timedelta(days=180):
+            candidate = candidate.replace(year=year - 1)
+        found_dates.append(candidate)
+    return found_dates
+
+
+def is_low_signal_event_notice(title: str) -> bool:
+    text = clean_headline_text(title).lower()
+    if not text:
+        return False
+    if any(hint in text for hint in LOW_SIGNAL_EVENT_NOTICE_HINTS):
+        if any(keyword in text for keyword in {"results", "reports", "beats", "misses", "approval", "awarded", "secures"}):
+            return False
+        return True
+    return False
+
+
+def headline_signal_note(title: str) -> str:
+    if is_low_signal_event_notice(title):
+        return "schedule or appearance notice, not the hard catalyst itself"
+    if is_commentary_headline(title):
+        return "commentary-style headline, not a clean company event"
+    if is_concrete_event_headline(title):
+        return "hard company event or transaction headline"
+    lowered = clean_headline_text(title).lower()
+    if any(hint in lowered for hint in MACRO_NEWS_HINTS):
+        return "sector or macro readthrough headline"
+    return "mixed-signal headline"
+
+
+def build_news_prompt_line(item: dict[str, str], index: int, reference: datetime | None = None) -> str:
+    if reference is None:
+        reference = local_now()
+    published_at = parse_news_timestamp(item.get("published_at") or item.get("time"), reference=reference)
+    notes: list[str] = []
+    if published_at is not None:
+        notes.append(f"published {published_at.strftime('%b %d %I:%M %p')} ({describe_relative_days(published_at, reference)})")
+
+    explicit_dates = extract_headline_dates(item.get("title", ""), reference=reference)
+    if explicit_dates:
+        explicit_date = explicit_dates[0]
+        notes.append(f"title mentions {explicit_date.strftime('%b %d, %Y')} ({describe_relative_days(explicit_date, reference)})")
+
+    signal_note = headline_signal_note(item.get("title", ""))
+    if signal_note:
+        notes.append(signal_note)
+
+    note_suffix = f" | {'; '.join(notes)}" if notes else ""
+    return f"{index}. [{safe_text(item.get('time'))}] {safe_text(item.get('source'))}: {safe_text(item.get('title'))}{note_suffix} ({safe_text(item.get('url'))})"
+
+
+def sanitize_note_filename(name: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*]+', " ", safe_text(name))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(".")
+    return cleaned or "Watchlist Snapshot"
+
+
+def obsidian_sector_folder_name(board: dict[str, Any]) -> str:
+    title = sanitize_note_filename(board.get("title", board.get("id", "Watchlist Snapshot")))
+    if board.get("kind") == "premarket":
+        return "Premarket Gappers"
+    return title
+
+
+def markdown_escape(value: Any) -> str:
+    text = safe_text(value).replace("\r", " ").replace("\n", " ")
+    return text.replace("|", r"\|").strip()
+
+
+def obsidian_vault_is_ready() -> bool:
+    return OBSIDIAN_VAULT_PATH.exists() and (OBSIDIAN_VAULT_PATH / ".obsidian").exists()
+
+
+def should_export_to_obsidian(board: dict[str, Any], origin: str) -> bool:
+    return (
+        OBSIDIAN_EXPORT_ENABLED
+        and board.get("kind", "").lower() in OBSIDIAN_EXPORT_BOARD_KINDS
+        and origin.lower() in OBSIDIAN_EXPORT_TRIGGER_ORIGINS
+    )
+
+
+def render_obsidian_snapshot_note(
+    board: dict[str, Any],
+    snapshot: dict[str, Any],
+    exported_at: datetime,
+) -> str:
+    rows = snapshot.get("rows", [])
+    summary = snapshot.get("summary", {})
+    market_brief = snapshot.get("market_brief", {})
+    scan_completed_at = to_local_time(
+        datetime.fromisoformat(snapshot["scan_completed_at"]) if snapshot.get("scan_completed_at") else None
+    )
+    note_title = f"{board['title']} - {exported_at.strftime('%Y-%m-%d')}"
+    lines = [
+        "---",
+        f'title: "{note_title.replace(chr(34), "")}"',
+        f'date: "{exported_at.strftime("%Y-%m-%d")}"',
+        f'exported_at: "{exported_at.isoformat()}"',
+        f'board_id: "{board["id"]}"',
+        f'board_kind: "{board["kind"]}"',
+        f'provider_order: "{", ".join(summary.get("provider_order", []))}"',
+        f"symbol_count: {summary.get('count', 0)}",
+        f"up_count: {summary.get('up_count', 0)}",
+        f"down_count: {summary.get('down_count', 0)}",
+        "---",
+        "",
+        f"# {note_title}",
+        "",
+        f"- Board: [{board['title']}]({board.get('url')})" if board.get("url") else f"- Board: {board['title']}",
+        f"- Scan completed: {scan_completed_at.strftime('%Y-%m-%d %I:%M:%S %p %Z') if scan_completed_at else 'Unknown'}",
+        f"- Exported: {exported_at.strftime('%Y-%m-%d %I:%M:%S %p %Z')}",
+        f"- Symbols analyzed: {summary.get('count', 0)}",
+        f"- AI sources: Gemini {summary.get('gemini_rows', 0)}, OpenRouter {summary.get('openrouter_rows', 0)}, OpenAI {summary.get('openai_rows', 0)}, Anthropic {summary.get('anthropic_rows', 0)}, Fallback {summary.get('fallback_rows', 0)}",
+        "",
+    ]
+
+    if board.get("kind") == "market-brief":
+        lines.extend(
+            [
+                "## Macro Summary",
+                "",
+                safe_text((market_brief.get("macro_summary") or {}).get("summary")),
+                "",
+            ]
+        )
+        for paragraph in [part.strip() for part in re.split(r"\n\s*\n", safe_text((market_brief.get("macro_summary") or {}).get("analysis_details"))) if part.strip()]:
+            lines.extend([paragraph, ""])
+
+        lines.extend(["## Macro Headlines", ""])
+        for item in market_brief.get("macro_headlines", []):
+            headline_bits = [safe_text(item.get("time")), safe_text(item.get("source"))]
+            headline_meta = " - ".join(bit for bit in headline_bits if bit)
+            bullet = f"- {headline_meta}: {safe_text(item.get('title'))}" if headline_meta else f"- {safe_text(item.get('title'))}"
+            lines.append(bullet)
+        lines.append("")
+
+        premarket_summary = market_brief.get("premarket_summary") or {}
+        lines.extend(["## Premarket Setup", "", safe_text(premarket_summary.get("summary")), ""])
+        for paragraph in [part.strip() for part in re.split(r"\n\s*\n", safe_text(premarket_summary.get("analysis_details"))) if part.strip()]:
+            lines.extend([paragraph, ""])
+        lines.extend(["Top premarket movers:", ""])
+        for mover in premarket_summary.get("top_movers", []):
+            lines.append(
+                f"- {safe_text(mover.get('ticker'))}: {format_percent(mover.get('move_percent'))} | {safe_text(mover.get('category'))} / {safe_text(mover.get('grade'))} | {safe_text(mover.get('reasoning'))}"
             )
-        return {**base_payload, "summary": clean_headline(headlines[0]["title"], ticker), "headlines": headlines}
-    except Exception as exc:  # pragma: no cover
-        return {
-            "summary": "Catalyst temporarily unavailable due to a Finviz request issue.",
-            "headlines": [],
-            "error": str(exc),
-        }
+        lines.append("")
+
+        lines.extend(["## Sector Briefs", ""])
+        for section in market_brief.get("sector_sections", []):
+            lines.extend(
+                [
+                    f"### {safe_text(section.get('title'))}",
+                    "",
+                    f"- Importance: {safe_text(section.get('importance'))}",
+                    f"- Symbols: {safe_text(section.get('symbol_count'))}",
+                    f"- AI Source: {provider_display_name(safe_text(section.get('ai_source')) or 'fallback')}",
+                    "",
+                    safe_text(section.get("summary")),
+                    "",
+                ]
+            )
+            for paragraph in [part.strip() for part in re.split(r"\n\s*\n", safe_text(section.get("analysis_details"))) if part.strip()]:
+                lines.extend([paragraph, ""])
+            if section.get("top_movers"):
+                lines.extend(["Top movers:", ""])
+                for mover in section.get("top_movers", []):
+                    lines.append(
+                        f"- {safe_text(mover.get('ticker'))}: {format_percent(mover.get('move_percent'))} | {safe_text(mover.get('category'))} / {safe_text(mover.get('grade'))} | {safe_text(mover.get('reasoning'))}"
+                    )
+                lines.append("")
+            if section.get("headlines"):
+                lines.extend(["Sector headlines:", ""])
+                for item in section.get("headlines", []):
+                    headline_bits = [safe_text(item.get("time")), safe_text(item.get("source"))]
+                    headline_meta = " - ".join(bit for bit in headline_bits if bit)
+                    bullet = f"- {headline_meta}: {safe_text(item.get('title'))}" if headline_meta else f"- {safe_text(item.get('title'))}"
+                    lines.append(bullet)
+                lines.append("")
+        return "\n".join(lines).strip() + "\n"
+
+    lines.extend(
+        [
+            "## Board Summary",
+            "",
+            "| Ticker | Move % | Volume | Float | Short % | Category | Grade | AI | Reasoning |",
+            "| --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |",
+        ]
+    )
+
+    for row in rows:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    markdown_escape(row.get("ticker")),
+                    markdown_escape(format_percent(row_move_percent(row))),
+                    markdown_escape(compact_number(row_move_volume(row))),
+                    markdown_escape(row.get("float_display", "-")),
+                    markdown_escape(row.get("short_display", "-")),
+                    markdown_escape(row.get("category", "")),
+                    markdown_escape(row.get("grade", "")),
+                    markdown_escape(provider_display_name(safe_text(row.get("ai_source")) or "fallback")),
+                    markdown_escape(row.get("reasoning", "")),
+                ]
+            )
+            + " |"
+        )
+
+    lines.extend(["", "## Detailed Analysis", ""])
+    for row in rows:
+        primary_headline = safe_text(row.get("primary_headline_title"))
+        supporting_headline = safe_text(row.get("supporting_headline_title"))
+        lines.extend(
+            [
+                f"### {row.get('ticker', '-')}",
+                "",
+                f"- Move: {format_percent(row_move_percent(row))} on {compact_number(row_move_volume(row))} shares",
+                f"- Category / Grade: {row.get('category', '-')} / {row.get('grade', '-')}",
+                f"- AI Source: {provider_display_name(safe_text(row.get('ai_source')) or 'fallback')}",
+                f"- Float / Short: {row.get('float_display', '-')} / {row.get('short_display', '-')}",
+                f"- Chart: {row.get('chart_url', '-')}",
+                "",
+            ]
+        )
+        if primary_headline:
+            lines.extend(
+                [
+                    f"Primary catalyst: {primary_headline}",
+                    "",
+                ]
+            )
+        if supporting_headline:
+            lines.extend(
+                [
+                    f"Supporting headline: {supporting_headline}",
+                    "",
+                ]
+            )
+        for paragraph in [part.strip() for part in re.split(r"\n\s*\n", safe_text(row.get("analysis_details"))) if part.strip()]:
+            lines.extend([paragraph, ""])
+        if row.get("news_items"):
+            lines.append("Latest Finviz headlines:")
+            lines.append("")
+            for item in row.get("news_items", [])[:5]:
+                headline_bits = [safe_text(item.get("time")), safe_text(item.get("source"))]
+                headline_meta = " - ".join(bit for bit in headline_bits if bit)
+                headline_text = safe_text(item.get("title"))
+                headline_url = safe_text(item.get("url"))
+                bullet = f"- {headline_meta}: {headline_text}" if headline_meta else f"- {headline_text}"
+                if headline_url:
+                    bullet += f" ([link]({headline_url}))"
+                lines.append(bullet)
+            lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
 
 
-def compute_grade(price: Any, ema10: Any, ema20: Any, sma50: Any) -> str:
-    values = [price, ema10, ema20, sma50]
-    if any(value is None or pd.isna(value) for value in values):
-        return "B"
-    price = float(price)
-    ema10 = float(ema10)
-    ema20 = float(ema20)
-    sma50 = float(sma50)
-    if price > ema10 > ema20 > sma50:
+def export_snapshot_to_obsidian(board: dict[str, Any], snapshot: dict[str, Any]) -> Path:
+    if not obsidian_vault_is_ready():
+        raise RuntimeError(f"Obsidian vault not found at {OBSIDIAN_VAULT_PATH}")
+
+    exported_at = local_now()
+    export_dir = OBSIDIAN_VAULT_PATH / Path(OBSIDIAN_EXPORT_FOLDER) / obsidian_sector_folder_name(board)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    note_path = export_dir / f"{exported_at.strftime('%Y-%m-%d')}.md"
+    note_path.write_text(render_obsidian_snapshot_note(board, snapshot, exported_at), encoding="utf-8")
+    return note_path
+
+
+def financing_flavor_from_headline(title: str) -> str:
+    text = clean_headline_text(title).lower()
+    if not text:
+        return ""
+    if any(keyword in text for keyword in DILUTIVE_FINANCING_HINTS):
+        return "dilutive"
+    if any(keyword in text for keyword in POSITIVE_FINANCING_HINTS):
+        return "strategic"
+    if re.search(r"\b(secures?|secured|closes?)\b.*(?:\$[0-9]|[0-9][0-9.,]*\s*(?:million|billion))", text):
+        return "strategic"
+    return ""
+
+
+def is_commentary_headline(title: str) -> bool:
+    text = clean_headline_text(title).lower()
+    if not text:
+        return False
+    if any(keyword in text for keyword in COMMENTARY_HEADLINE_HINTS):
+        return True
+    if "stock rises" in text and "after " not in text and " on " not in text:
+        return True
+    if "stock jumps" in text and "after " not in text and " on " not in text:
+        return True
+    return False
+
+
+def is_concrete_event_headline(title: str) -> bool:
+    text = clean_headline_text(title).lower()
+    if not text:
+        return False
+    if any(keyword in text for keyword in CONCRETE_EVENT_HINTS):
+        return True
+    if re.search(r"\b(after|following|on)\b.*\b(approval|deal|earnings|factory|financing|loan|results|trial)\b", text):
+        return True
+    return False
+
+
+def company_name_tokens(company_name: str) -> list[str]:
+    return [
+        token.lower()
+        for token in re.split(r"[^A-Za-z0-9]+", company_name or "")
+        if len(token) >= 4 and token.lower() not in {"holdings", "group", "inc", "corp", "plc", "company", "therapeutics", "biosciences"}
+    ]
+
+
+def headline_category_guess(title: str) -> str:
+    text = clean_headline_text(title).lower()
+    if is_low_signal_event_notice(title):
+        return "No Fresh News"
+    financing_flavor = financing_flavor_from_headline(text)
+    if financing_flavor:
+        return "Financing / Offering"
+    for category, keywords in CATEGORY_KEYWORDS:
+        if any(keyword.lower() in text for keyword in keywords):
+            return category
+    return "Low Float Momentum"
+
+
+def score_news_item(ticker: str, company_name: str, item: dict[str, str], index: int) -> float:
+    title = clean_headline_text(item.get("title", ""))
+    source = safe_text(item.get("source", "")).lower()
+    lowered = title.lower()
+    score = max(0, 10 - index)
+
+    if not title:
+        return -999
+
+    if ticker.lower() in lowered:
+        score += 8
+
+    company_tokens = company_name_tokens(company_name)
+    if any(token in lowered for token in company_tokens):
+        score += 10
+
+    if any(hint in lowered for hint in LEGAL_ALERT_HINTS):
+        score -= 25
+
+    category = headline_category_guess(title)
+    if category in {"Earnings", "FDA / Clinical", "PR / Contract", "M&A / Rumor"}:
+        score += 8
+    elif category in {"Financing / Offering", "Analyst / Upgrade"}:
+        score += 5
+    elif category == "Sympathy / Sector":
+        score -= 10
+
+    if is_concrete_event_headline(title):
+        score += 7
+    if is_commentary_headline(title):
+        score -= 6
+    if is_low_signal_event_notice(title):
+        score -= 12
+
+    financing_flavor = financing_flavor_from_headline(title)
+    if category == "Financing / Offering" and financing_flavor == "strategic":
+        score += 3
+
+    if any(hint in lowered for hint in MACRO_NEWS_HINTS):
+        score -= 12
+
+    if source in HIGH_TRUST_NEWS_SOURCES:
+        score += 4
+    elif source in {"business wire", "globenewswire", "pr newswire"}:
+        score += 2
+    elif source in LOW_SIGNAL_NEWS_SOURCES:
+        score -= 8
+
+    if source in LOW_SIGNAL_NEWS_SOURCES and not is_concrete_event_headline(title):
+        score -= 6
+
+    if len(re.findall(r"\([A-Z]{1,5}\)", title)) >= 2:
+        score -= 6
+
+    published_at = parse_news_timestamp(item.get("published_at") or item.get("time"))
+    if published_at is not None:
+        days_old = max(0, (local_now().date() - published_at.date()).days)
+        if days_old <= 1:
+            score += 4
+        elif days_old <= 3:
+            score += 2
+        elif days_old >= 14:
+            score -= 8
+        elif days_old >= 7:
+            score -= 4
+
+    return score
+
+
+def select_primary_news(ticker: str, company_name: str, news_items: list[dict[str, str]]) -> dict[str, str] | None:
+    if not news_items:
+        return None
+    ranked = sorted(
+        enumerate(news_items),
+        key=lambda pair: score_news_item(ticker, company_name, pair[1], pair[0]),
+        reverse=True,
+    )
+    return ranked[0][1] if ranked else None
+
+
+def select_supporting_news(ticker: str, company_name: str, news_items: list[dict[str, str]]) -> dict[str, str] | None:
+    candidates: list[tuple[float, dict[str, str]]] = []
+    for index, item in enumerate(news_items):
+        title = clean_headline_text(item.get("title", ""))
+        if infer_headline_relevance(ticker, company_name, [item]) != "direct":
+            continue
+        score = score_news_item(ticker, company_name, item, index)
+        if is_concrete_event_headline(title):
+            score += 8
+        if is_commentary_headline(title):
+            score -= 6
+        if "stock jumps" in title.lower() or "stock rises" in title.lower():
+            score -= 3
+        candidates.append((score, item))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda pair: pair[0])[1]
+
+
+def select_event_context_news(news_items: list[dict[str, str]], limit: int = 3) -> list[dict[str, str]]:
+    context_candidates: list[tuple[float, dict[str, str]]] = []
+    for index, item in enumerate(news_items):
+        title = clean_headline_text(item.get("title", ""))
+        if not is_low_signal_event_notice(title):
+            continue
+        score = score_news_item("", "", item, index) + 10
+        published_at = parse_news_timestamp(item.get("published_at") or item.get("time"))
+        if published_at is not None:
+            days_old = max(0, (local_now().date() - published_at.date()).days)
+            if days_old <= 3:
+                score += 4
+        context_candidates.append((score, item))
+
+    context_candidates.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in context_candidates[:limit]]
+
+
+def infer_headline_relevance(ticker: str, company_name: str, news_items: list[dict[str, str]]) -> str:
+    if not news_items:
+        return "none"
+
+    headline = safe_text(news_items[0].get("title")).lower()
+    if not headline:
+        return "none"
+
+    if ticker.lower() in headline:
+        return "direct"
+
+    tokens = company_name_tokens(company_name)
+    if any(token in headline for token in tokens):
+        return "direct"
+
+    macro_words = {
+        "nasdaq", "dow", "sp500", "s&p", "fed", "market", "stocks", "sector",
+        "deal", "deals", "war", "trump", "oil", "treasury", "yield", "futures",
+    }
+    if any(word in headline for word in macro_words):
+        return "macro"
+    return "indirect"
+
+
+def bucket_gap(value: float) -> str:
+    if value >= 100:
+        return "100+"
+    if value >= 50:
+        return "50-99"
+    if value >= 20:
+        return "20-49"
+    if value >= 10:
+        return "10-19"
+    return "<10"
+
+
+def bucket_volume(value: int) -> str:
+    if value >= 10_000_000:
+        return "10m+"
+    if value >= 3_000_000:
+        return "3m-10m"
+    if value >= 1_000_000:
+        return "1m-3m"
+    if value >= 300_000:
+        return "300k-1m"
+    return "<300k"
+
+
+def bucket_float(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    if value <= 20_000_000:
+        return "<20m"
+    if value <= 80_000_000:
+        return "20m-80m"
+    if value <= 200_000_000:
+        return "80m-200m"
+    return "200m+"
+
+
+def bucket_short(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    if value >= 25:
+        return "25+"
+    if value >= 12:
+        return "12-25"
+    if value >= 6:
+        return "6-12"
+    return "<6"
+
+
+def row_move_percent(row: dict[str, Any]) -> float:
+    primary = finite_float(row.get("move_percent"), default=float("nan"))
+    if math.isfinite(primary):
+        return primary
+    return finite_float(row.get("premarket_percent"), default=0.0)
+
+
+def row_move_volume(row: dict[str, Any]) -> int:
+    primary = finite_int(row.get("move_volume"), default=-1)
+    if primary >= 0:
+        return primary
+    return finite_int(row.get("premarket_volume"), default=0)
+
+
+def row_move_label(row: dict[str, Any]) -> str:
+    return safe_text(row.get("move_label")) or "Premarket move"
+
+
+def row_move_sentence(row: dict[str, Any]) -> str:
+    move_pct = row_move_percent(row)
+    move_vol = row_move_volume(row)
+    label = row_move_label(row).lower()
+    return f"{row['ticker']} is {format_percent(move_pct)} on the {label} on {compact_number(move_vol)} shares"
+
+
+def next_ai_cache_key(row: dict[str, Any], bundle: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "prompt_version": AI_PROMPT_VERSION,
+            "ticker": row["ticker"],
+            "headline_titles": [safe_text(item.get("title")) for item in bundle.get("news_items", [])[:5]],
+            "headline_sources": [safe_text(item.get("source")) for item in bundle.get("news_items", [])[:5]],
+            "analysis_mode": safe_text(row.get("analysis_mode")) or "premarket",
+            "move_label": row_move_label(row),
+            "gap_bucket": bucket_gap(row_move_percent(row)),
+            "volume_bucket": bucket_volume(row_move_volume(row)),
+            "float_bucket": bucket_float(row.get("float_shares")),
+            "short_bucket": bucket_short(row.get("short_percent")),
+            "sector": safe_text(bundle.get("sector")),
+            "industry": safe_text(bundle.get("industry")),
+        },
+        sort_keys=True,
+    )
+
+
+def set_provider_cooldown(provider: str, seconds: int) -> None:
+    with AI_STATE_LOCK:
+        current = AI_PROVIDER_COOLDOWNS.get(provider, 0.0)
+        AI_PROVIDER_COOLDOWNS[provider] = max(current, time.time() + max(60, seconds))
+
+
+def provider_in_cooldown(provider: str) -> bool:
+    with AI_STATE_LOCK:
+        return time.time() < AI_PROVIDER_COOLDOWNS.get(provider, 0.0)
+
+
+def heuristic_grade(premarket_pct: float, volume: int, short_pct: float | None, category: str) -> str:
+    score = 0
+    if premarket_pct >= 40:
+        score += 3
+    elif premarket_pct >= 20:
+        score += 2
+    elif premarket_pct >= 10:
+        score += 1
+
+    if volume >= 5_000_000:
+        score += 2
+    elif volume >= 1_000_000:
+        score += 1
+
+    if short_pct is not None:
+        if short_pct >= 15:
+            score += 2
+        elif short_pct >= 8:
+            score += 1
+
+    if category in {"Earnings", "FDA / Clinical", "PR / Contract", "M&A / Rumor"}:
+        score += 1
+    if category == "Financing / Offering":
+        score -= 2
+    if category == "No Fresh News":
+        score -= 2
+
+    if score >= 6:
         return "A"
-    if price < ema10 < ema20 < sma50:
+    if score >= 4:
+        return "B"
+    if score >= 2:
         return "C"
-    return "B"
+    return "D"
 
 
-def enrich_ticker(row: dict[str, Any]) -> dict[str, Any]:
-    ticker = row["ticker"]
-    current_volume = row["premarket_volume"] or 0
+def describe_volume(volume: int) -> str:
+    if volume >= 10_000_000:
+        return "already trading with exceptional liquidity"
+    if volume >= 3_000_000:
+        return "already trading with strong liquidity"
+    if volume >= 1_000_000:
+        return "trading with usable liquidity"
+    if volume >= 300_000:
+        return "trading but still a bit thin"
+    return "still very thin"
 
-    volume_payload = fetch_all_time_high_volume(ticker)
-    ath_volume = volume_payload.get("all_time_high_volume")
-    ratio = None
-    is_breaker = False
-    if ath_volume and ath_volume > 0:
-        ratio = current_volume / ath_volume
-        is_breaker = ratio >= 0.8 or current_volume > ath_volume
 
-    news_payload = fetch_news_bundle(ticker)
-    context = build_trade_context(row, news_payload, ratio, is_breaker)
+def describe_float(float_shares: float | None) -> str:
+    if float_shares is None:
+        return "float is unclear"
+    if float_shares <= 20_000_000:
+        return "float is tight enough to accelerate quickly"
+    if float_shares <= 80_000_000:
+        return "float is workable for a momentum session"
+    if float_shares <= 200_000_000:
+        return "float is not especially tight, so the move needs real sponsorship"
+    return "float is large enough that the move usually needs broad participation"
+
+
+def describe_short_interest(short_pct: float | None) -> str:
+    if short_pct is None:
+        return "short positioning is unclear"
+    if short_pct >= 25:
+        return "short interest is very elevated, so squeeze pressure can matter"
+    if short_pct >= 12:
+        return "short interest is elevated enough to help extension"
+    if short_pct >= 6:
+        return "short interest adds some tactical fuel"
+    return "there is not much squeeze fuel in the positioning"
+
+
+def build_peer_fallback_reasoning(row: dict[str, Any], peer_context: dict[str, Any]) -> str:
+    leader_ticker = safe_text(peer_context.get("leader_ticker")) or "the leader"
+    leader_stub = shorten_text(peer_context.get("leader_headline", ""), limit=72)
+    support_stub = shorten_text(peer_context.get("support_headline", ""), limit=72)
+    has_support = bool(peer_context.get("has_company_specific_support") and support_stub)
+
+    if has_support:
+        return (
+            f"{row['ticker']} is trading as a sector rerate with {leader_ticker} after {leader_stub}, while "
+            f"{support_stub.lower()} gives it real company-specific backing; it still needs broad participation after the open to hold."
+        )
+
+    return (
+        f"{row['ticker']} looks more like sympathy with {leader_ticker} after {leader_stub}; "
+        f"without a cleaner standalone trigger, this is second-order flow that can fade fast once the leader cools."
+    )
+
+
+def build_peer_fallback_analysis(row: dict[str, Any], category: str, grade: str, peer_context: dict[str, Any]) -> str:
+    leader_ticker = safe_text(peer_context.get("leader_ticker")) or "the group leader"
+    leader_headline = safe_text(peer_context.get("leader_headline")) or "the strongest peer headline in the group"
+    support_headline = safe_text(peer_context.get("support_headline"))
+    has_support = bool(peer_context.get("has_company_specific_support") and support_headline)
+    premarket_pct = float(row.get("premarket_percent") or 0.0)
+    volume = int(row.get("premarket_volume") or 0)
+
+    paragraph_1 = (
+        f"{row['ticker']} is up {format_percent(premarket_pct)} premarket on {compact_number(volume)} shares, "
+        f"with float around {row['float_display']} and short interest around {row['short_display']}. "
+        f"The better read here is {category.lower()}: {leader_ticker}'s headline, \"{leader_headline}\", is helping rerate the group."
+    )
+
+    if has_support:
+        paragraph_2 = (
+            f"This is not pure no-news sympathy, though. {row['ticker']}'s own best company-specific headline is "
+            f"\"{support_headline}\", which gives traders a real company angle even if it is not as catalytic as the leader's news."
+        )
+    else:
+        paragraph_2 = (
+            f"There is not a cleaner standalone company-specific trigger than the group rerating itself, so traders are mostly leaning on "
+            f"{leader_ticker}'s news to justify the move."
+        )
+
+    paragraph_3 = (
+        f"The tape still matters. {describe_volume(volume).capitalize()}, {describe_float(row.get('float_shares'))}, and "
+        f"{describe_short_interest(row.get('short_percent'))}. If {leader_ticker} stays bid and the group keeps getting rerated, "
+        f"{row['ticker']} can trend with it; if the leader fades, this kind of second-order move usually weakens first."
+    )
+
+    paragraph_4 = (
+        f"That is why the setup sits at {grade} instead of a full standalone upgrade. The stock has enough context to matter, "
+        "but it still needs sector follow-through, not just a one-print gap."
+    )
+    return "\n\n".join([paragraph_1, paragraph_2, paragraph_3, paragraph_4])
+
+
+def build_fallback_reasoning(row: dict[str, Any], bundle: dict[str, Any], category: str, grade: str) -> str:
+    peer_context = bundle.get("peer_context") or row.get("peer_context")
+    if peer_context:
+        return build_peer_fallback_reasoning(row, peer_context)
+
+    news_items = bundle.get("news_items", [])
+    top_headline = safe_text(bundle.get("primary_headline_title")) or (
+        safe_text(news_items[0].get("title")) if news_items else "No fresh company-specific headline"
+    )
+    relevance = infer_headline_relevance(
+        row["ticker"],
+        row.get("company_name", ""),
+        [bundle.get("primary_news")] if bundle.get("primary_news") else news_items,
+    )
+    premarket_pct = float(row.get("premarket_percent") or 0.0)
+    volume = int(row.get("premarket_volume") or 0)
+    float_shares = row.get("float_shares")
+    short_pct = row.get("short_percent")
+
+    catalyst_read = {
+        "Earnings": "earnings can sustain if the numbers truly reset expectations",
+        "FDA / Clinical": "clinical-style headlines can hold when the data changes the company narrative",
+        "PR / Contract": "contract-style headlines work only if the economics look material",
+        "Financing / Offering": "financing usually caps upside unless the raise clearly removes near-term risk",
+        "Analyst / Upgrade": "analyst-driven moves need real follow-through from buyers, not just the headline",
+        "M&A / Rumor": "M&A-style setups can trend hard if the market believes the headline is actionable",
+        "Sympathy / Sector": "sympathy moves can extend early but often fade without a company-specific trigger",
+        "Low Float Momentum": "this looks more like tape-driven momentum than a clean fundamental re-rate",
+        "No Fresh News": "without a clean fresh catalyst, the move is mostly a liquidity and positioning story",
+    }.get(category, "the setup needs a real catalyst to hold")
+
+    tape_read = describe_volume(volume)
+    squeeze_read = describe_short_interest(short_pct)
+    float_read = describe_float(float_shares)
+
+    caveat_parts: list[str] = []
+    if relevance == "macro":
+        caveat_parts.append("the top headline reads macro rather than company-specific")
+    elif relevance == "indirect":
+        caveat_parts.append("the news link is not fully clean or direct")
+    elif relevance == "none":
+        caveat_parts.append("there is no fresh company-specific news in the feed")
+
+    if premarket_pct >= 80 and category in {"Low Float Momentum", "No Fresh News", "Sympathy / Sector"}:
+        caveat_parts.append("the gap is so extreme that chase risk is high if buyers stall after the open")
+    elif premarket_pct <= 10 and category not in {"Earnings", "FDA / Clinical", "M&A / Rumor"}:
+        caveat_parts.append("the gap is modest enough that it may struggle to attract sustained momentum")
+
+    if volume < 500_000:
+        caveat_parts.append("premarket liquidity is still thin")
+    if category == "Financing / Offering":
+        caveat_parts.append("dilution overhang can cap follow-through")
+
+    caveat = caveat_parts[0] if caveat_parts else "buyers still need to prove the move is more than a first-hour squeeze"
+
+    headline_stub = top_headline[:88].rstrip(". ")
+    if relevance == "direct":
+        opening = f"{headline_stub} is the real trigger here"
+    elif relevance == "macro":
+        opening = f"{headline_stub} is being traded as the lead story"
+    elif relevance == "indirect":
+        opening = f"{headline_stub} is the headline traders are leaning on"
+    else:
+        opening = "There is no clean company-specific headline in the feed"
+
+    return f"{opening}; {catalyst_read}, with {tape_read}, {float_read}, and {squeeze_read}, but {caveat}."
+
+
+def build_fallback_analysis(row: dict[str, Any], bundle: dict[str, Any], category: str, grade: str) -> str:
+    peer_context = bundle.get("peer_context") or row.get("peer_context")
+    if peer_context:
+        return build_peer_fallback_analysis(row, category, grade, peer_context)
+
+    news_items = bundle.get("news_items", [])
+    headline = safe_text(bundle.get("primary_headline_title")) or (
+        safe_text(news_items[0].get("title")) if news_items else "No strong multi-source headline was returned."
+    )
+    relevance = infer_headline_relevance(
+        row["ticker"],
+        row.get("company_name", ""),
+        [bundle.get("primary_news")] if bundle.get("primary_news") else news_items,
+    )
+    premarket_pct = float(row.get("premarket_percent") or 0.0)
+    volume = int(row.get("premarket_volume") or 0)
+
+    if relevance == "direct":
+        headline_quality = "The lead headline looks company-specific, so the move has at least a plausible catalyst behind it."
+    elif relevance == "macro":
+        headline_quality = "The lead headline reads more macro or sector-wide than company-specific, which makes the catalyst quality weaker than the tape may suggest."
+    elif relevance == "indirect":
+        headline_quality = "The lead headline is only loosely tied to the company, so traders should assume the tape is doing more work than the news."
+    else:
+        headline_quality = "There is no clean fresh company-specific headline in the feed, so this should be treated primarily as a momentum or positioning move."
+
+    paragraph_1 = (
+        f"{row_move_sentence(row)}, "
+        f"with float around {row['float_display']} and short interest around {row['short_display']}. "
+        f"The current read tags it as {category.lower()} and grades it {grade}. {headline_quality}"
+    )
+
+    paragraph_2 = (
+        f"The tape itself is the second part of the story. {describe_volume(volume).capitalize()}, "
+        f"{describe_float(row.get('float_shares'))}, and {describe_short_interest(row.get('short_percent'))}. "
+        "That combination determines whether the move can keep expanding after the open or whether it likely peaks on the first burst of attention."
+    )
+
+    paragraph_3 = (
+        f"The main caveat is the quality of the catalyst read: \"{headline}\". "
+        "If traders start realizing the headline is stale, indirect, or financially dilutive, the setup can fade fast even after a strong gap. "
+        "If the market keeps treating it as a genuine repricing event, then dips can stay shallow and volume can keep recycling higher."
+    )
+
+    return "\n\n".join([paragraph_1, paragraph_2, paragraph_3])
+
+
+def fallback_ai_payload(row: dict[str, Any], bundle: dict[str, Any], error_text: str = "") -> dict[str, str]:
+    news_items = bundle.get("news_items", [])
+    category = safe_text(bundle.get("primary_category")) or infer_category_from_news(news_items)
+    premarket_pct = row_move_percent(row)
+    volume = row_move_volume(row)
+    short_pct = parse_metric_number(bundle.get("short_float_raw"))
+    grade = heuristic_grade(premarket_pct, volume, short_pct, category)
+
     return {
-        "all_time_high_volume": ath_volume,
-        "volume_ratio": ratio,
-        "is_volume_breaker": is_breaker,
-        "flag": "VOLUME BREAKER" if is_breaker else "",
-        "catalyst_summary": context["catalyst_summary"],
-        "event_label": context["event_label"],
-        "direction": context["direction"],
-        "headlines": context["headlines"],
-        "short_float_str": context["short_float_str"],
-        "market_cap": context["market_cap"],
-        "sector": context["sector"],
-        "edge": context["edge"],
-        "catalyst_quality":           context["catalyst_quality"],
-        "catalyst_quality_reason":    context["catalyst_quality_reason"],
-        "why_today":                  context["why_today"],
-        "story_before":               context["story_before"],
-        "story_after":                context["story_after"],
-        "mechanism":                  context["mechanism"],
-        "float_analysis":             context["float_analysis"],
-        "bullish":                    context["bullish"],
-        "bearish":                    context["bearish"],
-        "key_uncertainty":            context["key_uncertainty"],
-        "catalyst_durability":        context["catalyst_durability"],
-        "catalyst_durability_reason": context["catalyst_durability_reason"],
-        "dilution_risk":              context["dilution_risk"],
-        "trade_structure":            context["trade_structure"],
-        "trade_structure_reason":     context["trade_structure_reason"],
-        "entry_thesis":               context["entry_thesis"],
-        "invalidation":               context["invalidation"],
-        "rerating":                   context["rerating"],
-        "rerating_reason":            context["rerating_reason"],
+        "category": category,
+        "grade": grade,
+        "reasoning": build_fallback_reasoning(row, bundle, category, grade),
+        "analysis_details": build_fallback_analysis(row, bundle, category, grade),
+        "ai_source": "fallback",
+        "ai_error": error_text,
     }
 
 
-def scan_premarket_gappers(
-    min_gap_pct: float,
-    min_volume: int,
-    min_price: float,
-    max_price: float,
-    limit: int,
-) -> pd.DataFrame:
-    columns = [
-        "name",
-        "close",
-        "premarket_change",
-        "premarket_volume",
-        "premarket_close",
-        "float_shares_outstanding_current",
-        "EMA10",
-        "EMA20",
-        "SMA50",
-        "exchange",
-        "type",
-    ]
+def get_gemini_client() -> genai.Client:
+    global GEMINI_CLIENT
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
 
+    with GEMINI_CLIENT_LOCK:
+        if GEMINI_CLIENT is None:
+            GEMINI_CLIENT = genai.Client(api_key=api_key)
+        return GEMINI_CLIENT
+
+
+def get_openrouter_api_key() -> str:
+    for env_name in ("OPENROUTER_API_KEY", "OPENROUTER_KEY", "OR_API_KEY"):
+        api_key = os.getenv(env_name, "").strip()
+        if api_key:
+            return api_key
+    return ""
+
+
+def available_ai_providers() -> list[str]:
+    providers: list[str] = []
+    if os.getenv("GEMINI_API_KEY", "").strip():
+        providers.append("gemini")
+    if get_openrouter_api_key():
+        providers.append("openrouter")
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        providers.append("openai")
+    if os.getenv("ANTHROPIC_API_KEY", "").strip():
+        providers.append("anthropic")
+    return providers
+
+
+def extract_retry_delay_seconds(error_text: str, default_seconds: int = 1800) -> int:
+    match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", error_text, flags=re.IGNORECASE)
+    if match:
+        return max(60, int(float(match.group(1))) + 5)
+    return default_seconds
+
+
+def call_gemini_provider(prompt: str) -> dict[str, Any]:
+    client = get_gemini_client()
+    config = {
+        "temperature": 0.2,
+        "response_mime_type": "application/json",
+        "max_output_tokens": 900,
+    }
+    last_error: Exception | None = None
+    for model_name in GEMINI_MODEL_CANDIDATES:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config,
+            )
+            return extract_json_object(response.text)
+        except Exception as exc:
+            last_error = exc
+            continue
+    raise last_error or RuntimeError("Gemini request failed.")
+
+
+def call_openai_provider(prompt: str) -> dict[str, Any]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY environment variable.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    messages = [
+        {"role": "system", "content": AI_SYSTEM_MESSAGE},
+        {"role": "user", "content": prompt},
+    ]
+    last_error: Exception | None = None
+
+    for model_name in OPENAI_MODEL_CANDIDATES:
+        try:
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": model_name,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=45,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"OpenAI {response.status_code}: {response.text}")
+            payload = response.json()
+            content = payload["choices"][0]["message"]["content"]
+            return extract_json_object(content)
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    raise last_error or RuntimeError("OpenAI request failed.")
+
+
+def call_openrouter_provider(prompt: str) -> dict[str, Any]:
+    api_key = get_openrouter_api_key()
+    if not api_key:
+        raise RuntimeError("Missing OPENROUTER_API_KEY environment variable.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:5000"),
+        "X-Title": os.getenv("OPENROUTER_APP_NAME", APP_TITLE),
+    }
+    messages = [
+        {"role": "system", "content": AI_SYSTEM_MESSAGE},
+        {"role": "user", "content": prompt},
+    ]
+    last_error: Exception | None = None
+
+    for model_name in OPENROUTER_MODEL_CANDIDATES:
+        request_body = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            with OPENROUTER_REQUEST_SEMAPHORE:
+                response = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=request_body,
+                    timeout=OPENROUTER_TIMEOUT_SECONDS,
+                )
+            if response.status_code >= 400:
+                raise RuntimeError(f"OpenRouter {response.status_code}: {response.text}")
+            payload = response.json()
+            content = payload["choices"][0]["message"]["content"]
+            return extract_json_object(content)
+        except Exception as exc:
+            last_error = exc
+            if model_name != "openrouter/free":
+                continue
+            try:
+                # Some free endpoints may not support JSON mode on every routed model.
+                with OPENROUTER_REQUEST_SEMAPHORE:
+                    response = requests.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": model_name,
+                            "messages": messages,
+                            "temperature": 0.2,
+                        },
+                        timeout=OPENROUTER_TIMEOUT_SECONDS,
+                    )
+                if response.status_code >= 400:
+                    raise RuntimeError(f"OpenRouter {response.status_code}: {response.text}")
+                payload = response.json()
+                content = payload["choices"][0]["message"]["content"]
+                return extract_json_object(content)
+            except Exception as retry_exc:
+                last_error = retry_exc
+                continue
+
+    raise last_error or RuntimeError("OpenRouter request failed.")
+
+
+def call_anthropic_provider(prompt: str) -> dict[str, Any]:
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing ANTHROPIC_API_KEY environment variable.")
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    last_error: Exception | None = None
+
+    for model_name in ANTHROPIC_MODEL_CANDIDATES:
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json={
+                    "model": model_name,
+                    "max_tokens": 900,
+                    "temperature": 0.2,
+                    "system": AI_SYSTEM_MESSAGE,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=45,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"Anthropic {response.status_code}: {response.text}")
+            payload = response.json()
+            content_items = payload.get("content", [])
+            text = "\n".join(item.get("text", "") for item in content_items if item.get("type") == "text")
+            return extract_json_object(text)
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    raise last_error or RuntimeError("Anthropic request failed.")
+
+
+def build_gemini_prompt(row: dict[str, Any], bundle: dict[str, Any]) -> str:
+    news_items = bundle.get("news_items", [])
+    primary_title = safe_text(bundle.get("primary_headline_title"))
+    primary_source = safe_text(bundle.get("primary_headline_source"))
+    primary_category = safe_text(bundle.get("primary_category"))
+    primary_relevance = safe_text(bundle.get("primary_relevance"))
+    event_context_titles = [clean_headline_text(title) for title in bundle.get("event_context_titles", []) if clean_headline_text(title)]
+    analysis_mode = safe_text(row.get("analysis_mode")) or "premarket"
+    current_local_time = local_now()
+    current_local_stamp = current_local_time.strftime("%Y-%m-%d %I:%M %p %Z")
+    current_local_date = current_local_time.strftime("%Y-%m-%d")
+    primary_headline_dates = extract_headline_dates(primary_title, reference=current_local_time)
+    primary_timing_note_parts: list[str] = []
+    primary_published_at = parse_news_timestamp(
+        bundle.get("primary_news", {}).get("published_at") or bundle.get("primary_headline_time"),
+        reference=current_local_time,
+    )
+    if primary_published_at is not None:
+        primary_timing_note_parts.append(
+            f"published {primary_published_at.strftime('%b %d %I:%M %p')} ({describe_relative_days(primary_published_at, current_local_time)})"
+        )
+    if primary_headline_dates:
+        event_date = primary_headline_dates[0]
+        primary_timing_note_parts.append(
+            f"title mentions {event_date.strftime('%b %d, %Y')} ({describe_relative_days(event_date, current_local_time)})"
+        )
+    primary_signal_note = headline_signal_note(primary_title)
+    if primary_signal_note:
+        primary_timing_note_parts.append(primary_signal_note)
+    primary_timing_note = "; ".join(primary_timing_note_parts) or "-"
+    event_context_block = "\n".join(
+        f"- {title}"
+        for title in event_context_titles[:3]
+        if title and title != primary_title
+    ) or "-"
+    if news_items:
+        news_block = "\n".join(
+            build_news_prompt_line(item, idx, reference=current_local_time)
+            for idx, item in enumerate(news_items, start=1)
+        )
+    else:
+        news_block = "No recent merged headlines returned."
+
+    if analysis_mode == "watchlist":
+        return f"""
+You are an elite US stock catalyst analyst for active day traders.
+Your job is to explain what is moving this stock TODAY and whether that move looks company-specific, sector-driven, macro-driven, or mostly technical.
+
+Return ONLY valid JSON with exactly these keys:
+- category
+- grade
+- reasoning
+- analysis_details
+
+Hard rules:
+1. category must be exactly one of: {", ".join(CATEGORY_OPTIONS)}
+2. grade must be exactly one of: A, B, C, D
+3. reasoning must be one sentence, plain English, high signal, max 34 words
+4. reasoning must explicitly say what happened to the stock today and the key nuance behind the move
+5. analysis_details must be 3-4 short paragraphs, no bullet points, no markdown headings
+6. Use only the supplied data. If the move looks like sympathy, stale continuation, or generic sector flow, say so clearly.
+7. Grade by catalyst quality, freshness, day-of tape quality, crowding, squeeze potential, dilution risk, and likelihood the move keeps following through today.
+8. Favor real catalysts: earnings, trial/FDA, meaningful contracts, M&A, strategic financing, capex buildout, clean analyst upgrades.
+9. Penalize weak setups: no fresh news, vague commentary headlines, financing overhang, macro-only moves, or second-order sympathy with no company-specific backup.
+10. Use the exact current date below when judging timing. Do not call an upcoming event stale or more than a year away unless the supplied dates actually say that.
+11. Conference-call notices, fireside chats, interviews, previews, and conference appearances are usually setup context, not the actual catalyst, unless paired with hard new results or a transaction.
+12. If setup-context headlines are present, mention them as the next checkpoint or part of the setup, especially when traders are positioning into that event.
+
+The reasoning sentence should explain:
+- what happened to the stock today
+- what catalyst or sector rerating is driving it
+- the most important caveat keeping the move from a higher grade
+
+The analysis_details paragraphs should cover:
+- whether the lead headline is truly company-specific and day-one relevant
+- whether the move is standalone or sympathy / sector rerating
+- what the tape says about liquidity, float, short crowding, and continuation odds
+- why this deserves its exact grade instead of the one above or below
+
+Grading framework:
+- A: Clear, fresh, high-quality catalyst with strong same-day follow-through potential
+- B: Real catalyst and usable tape, but one meaningful caveat remains
+- C: Mixed, sympathy-led, or second-tier catalyst where the tape matters more than the headline
+- D: Weak, stale, financing-heavy, or unclear catalyst that likely fades
+
+Current timing context:
+- Current analysis timestamp: {current_local_stamp}
+- Current analysis date: {current_local_date}
+
+Stock snapshot:
+- Ticker: {row["ticker"]}
+- Company: {bundle.get("company") or row.get("company_name") or row["ticker"]}
+- Day move percent: {format_percent(row.get("day_change_percent"))}
+- Day volume: {compact_number(row.get("regular_volume"))}
+- Premarket percent: {format_percent(row.get("raw_premarket_percent"))}
+- Premarket volume: {compact_number(row.get("raw_premarket_volume"))}
+- Active move lens: {row_move_label(row)} {format_percent(row_move_percent(row))}
+- Active move volume: {compact_number(row_move_volume(row))}
+- Last price: {row.get("price_display")}
+- Float: {row.get("float_display")}
+- Short percent: {row.get("short_display")}
+- Sector: {bundle.get("sector") or "-"}
+- Industry: {bundle.get("industry") or "-"}
+- Market cap: {bundle.get("market_cap_raw") or "-"}
+- Primary catalyst candidate: {primary_title or "-"}
+- Primary candidate source: {primary_source or "-"}
+- Primary candidate category guess: {primary_category or "-"}
+- Primary candidate relevance guess: {primary_relevance or "-"}
+- Primary candidate timing note: {primary_timing_note}
+- Additional setup-context headlines:
+{event_context_block}
+
+Latest headlines:
+{news_block}
+""".strip()
+
+    return f"""
+You are an elite US premarket catalyst analyst for active day traders.
+Your job is to judge whether this stock's premarket move is truly tradeable TODAY, not whether it is a good long-term investment.
+
+Return ONLY valid JSON with exactly these keys:
+- category
+- grade
+- reasoning
+- analysis_details
+
+Hard rules:
+1. category must be exactly one of: {", ".join(CATEGORY_OPTIONS)}
+2. grade must be exactly one of: A, B, C, D
+3. reasoning must be one sentence, plain English, high signal, max 34 words
+4. reasoning must sound like a real catalyst trader, not a generic AI summary
+5. analysis_details must be 3-4 short paragraphs, no bullet points, no markdown headings
+6. Use only the supplied data. If the news looks stale, weak, ambiguous, or like pure momentum, penalize the grade.
+7. Grade by catalyst quality, freshness, tape quality, crowding, squeeze potential, dilution risk, and likelihood of intraday follow-through.
+8. Favor real catalysts: earnings, trial/FDA, meaningful contracts, M&A, clean analyst upgrades.
+9. Penalize weak setups: no fresh news, sympathy-only action, vague PR, financing/offering overhang, or purely technical squeezes with no clear trigger.
+10. Use the exact current date below when judging timing. Do not call an upcoming event stale or more than a year away unless the supplied dates actually say that.
+11. Conference-call notices, fireside chats, interviews, previews, and conference appearances are usually setup context, not the actual catalyst, unless paired with hard new results or a transaction.
+12. If setup-context headlines are present, mention them as the next checkpoint or part of the setup, especially when traders are positioning into that event.
+
+The reasoning sentence should explain:
+- what actually matters about the setup today
+- the best reason it could continue
+- the most important nuance or caveat holding the grade back
+
+The analysis_details paragraphs should cover:
+- whether the headline is truly company-specific and catalyst-grade
+- what the tape says about liquidity, float, short crowding, and squeeze odds
+- what would make the move hold versus fail after the open
+- why this deserves its exact grade instead of the one above or below
+
+Grading framework:
+- A: Clear, fresh, high-quality catalyst with strong intraday follow-through potential and clean trader interest
+- B: Real catalyst and decent tape, but one meaningful caveat remains
+- C: Mixed or second-tier catalyst, or the move may be mostly technical / crowded
+- D: Weak, stale, low-quality, financing-heavy, or unclear catalyst that likely fades
+
+Current timing context:
+- Current analysis timestamp: {current_local_stamp}
+- Current analysis date: {current_local_date}
+
+Stock snapshot:
+- Ticker: {row["ticker"]}
+- Company: {bundle.get("company") or row.get("company_name") or row["ticker"]}
+- Premarket percent: {format_percent(row.get("premarket_percent"))}
+- Premarket volume: {compact_number(row.get("premarket_volume"))}
+- Premarket price: {row.get("price_display")}
+- Float: {row.get("float_display")}
+- Short percent: {row.get("short_display")}
+- Sector: {bundle.get("sector") or "-"}
+- Industry: {bundle.get("industry") or "-"}
+- Market cap: {bundle.get("market_cap_raw") or "-"}
+- Primary catalyst candidate: {primary_title or "-"}
+- Primary candidate source: {primary_source or "-"}
+- Primary candidate category guess: {primary_category or "-"}
+- Primary candidate relevance guess: {primary_relevance or "-"}
+- Primary candidate timing note: {primary_timing_note}
+- Additional setup-context headlines:
+{event_context_block}
+
+Latest headlines:
+{news_block}
+""".strip()
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    candidate = safe_text(text)
+    if not candidate:
+        raise ValueError("Empty Gemini response.")
+
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate)
+        candidate = re.sub(r"\s*```$", "", candidate)
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        start = candidate.find("{")
+        while start != -1:
+            try:
+                obj, _ = decoder.raw_decode(candidate[start:])
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                pass
+            start = candidate.find("{", start + 1)
+    raise ValueError("Gemini response did not contain valid JSON.")
+
+
+def normalize_ai_payload(
+    row: dict[str, Any],
+    bundle: dict[str, Any],
+    payload: dict[str, Any],
+    provider: str = "gemini",
+) -> dict[str, str]:
+    category = safe_text(payload.get("category"))
+    if category not in CATEGORY_OPTIONS:
+        category = infer_category_from_news(bundle.get("news_items", []))
+
+    grade = safe_text(payload.get("grade")).upper()
+    if grade not in {"A", "B", "C", "D"}:
+        grade = heuristic_grade(
+            row_move_percent(row),
+            row_move_volume(row),
+            parse_metric_number(bundle.get("short_float_raw")),
+            category,
+        )
+
+    reasoning = " ".join(safe_text(payload.get("reasoning")).split())
+    if not reasoning:
+        reasoning = fallback_ai_payload(row, bundle)["reasoning"]
+
+    analysis_details = safe_text(payload.get("analysis_details"))
+    if not analysis_details:
+        analysis_details = fallback_ai_payload(row, bundle)["analysis_details"]
+
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", analysis_details) if part.strip()]
+    analysis_details = "\n\n".join(paragraphs[:4]) if paragraphs else fallback_ai_payload(row, bundle)["analysis_details"]
+
+    return {
+        "category": category,
+        "grade": grade,
+        "reasoning": reasoning[:240],
+        "analysis_details": analysis_details,
+        "ai_source": provider,
+        "ai_error": "",
+    }
+
+
+def request_ai_json(prompt: str) -> tuple[dict[str, Any] | None, str | None, str]:
+    last_error = "No AI provider key is configured."
+    provider_handlers = {
+        "gemini": call_gemini_provider,
+        "openrouter": call_openrouter_provider,
+        "openai": call_openai_provider,
+        "anthropic": call_anthropic_provider,
+    }
+
+    enabled_providers = set(available_ai_providers())
+    ordered_providers = [provider for provider in AI_PROVIDER_ORDER if provider in provider_handlers]
+    for provider in enabled_providers:
+        if provider not in ordered_providers:
+            if provider == "openrouter" and "gemini" in ordered_providers:
+                ordered_providers.insert(ordered_providers.index("gemini") + 1, provider)
+            else:
+                ordered_providers.append(provider)
+
+    for provider in ordered_providers:
+        if provider not in provider_handlers or provider not in enabled_providers:
+            continue
+        if provider_in_cooldown(provider):
+            last_error = f"{provider_display_name(provider)} temporarily unavailable because quota or rate limit was recently hit."
+            continue
+        try:
+            return provider_handlers[provider](prompt), provider, ""
+        except Exception as exc:
+            last_error = str(exc)
+            err_str = str(exc)
+            if (
+                "429" in err_str
+                or "RESOURCE_EXHAUSTED" in err_str
+                or "Quota exceeded" in err_str
+                or "insufficient_quota" in err_str
+                or "credit balance is too low" in err_str
+            ):
+                set_provider_cooldown(provider, extract_retry_delay_seconds(err_str))
+            continue
+
+    return None, None, last_error
+
+
+def analyze_with_ai(row: dict[str, Any], bundle: dict[str, Any]) -> dict[str, str]:
+    cache_key = next_ai_cache_key(row, bundle)
+
+    with ANALYSIS_CACHE_LOCK:
+        cached = ANALYSIS_CACHE.get(cache_key)
+        if cached and time.time() - cached["created_at"] < cached.get("ttl", ANALYSIS_CACHE_TTL_SECONDS):
+            return cached["payload"]
+
+    prompt = build_gemini_prompt(row, bundle)
+    payload, provider, last_error = request_ai_json(prompt)
+    normalized: dict[str, str] | None = None
+    if payload is not None and provider is not None:
+        normalized = normalize_ai_payload(row, bundle, payload, provider=provider)
+
+    if normalized is None:
+        normalized = fallback_ai_payload(row, bundle, error_text=last_error)
+
+    with ANALYSIS_CACHE_LOCK:
+        ttl = ANALYSIS_CACHE_TTL_SECONDS if normalized.get("ai_source") != "fallback" else 120
+        ANALYSIS_CACHE[cache_key] = {"created_at": time.time(), "ttl": ttl, "payload": normalized}
+
+    return normalized
+
+
+def fetch_finviz_bundle(ticker: str) -> dict[str, Any]:
+    with NEWS_CACHE_LOCK:
+        cached = NEWS_CACHE.get(ticker)
+        if cached and time.time() - cached["created_at"] < NEWS_CACHE_TTL_SECONDS:
+            return cached["payload"]
+
+    quote_client = finvizfinance(ticker)
+
+    fundamentals: dict[str, Any] = {}
+    company = ""
+    sector = ""
+    industry = ""
+    market_cap_raw = ""
+    short_float_raw = ""
+    fallback_float_raw = ""
+
+    try:
+        fundamentals = quote_client.ticker_fundament(raw=True, output_format="dict") or {}
+        company = safe_text(fundamentals.get("Company"))
+        sector = safe_text(fundamentals.get("Sector"))
+        industry = safe_text(fundamentals.get("Industry"))
+        market_cap_raw = safe_text(fundamentals.get("Market Cap"))
+        short_float_raw = safe_text(fundamentals.get("Short Float"))
+        fallback_float_raw = safe_text(fundamentals.get("Shs Float") or fundamentals.get("Shs Outstand"))
+    except Exception:
+        fundamentals = {}
+
+    try:
+        news_frame = quote_client.ticker_news()
+    except Exception:
+        news_frame = pd.DataFrame()
+
+    finviz_news_items = normalize_news_frame(news_frame)
+    yfinance_news_items = fetch_yfinance_news_items(ticker)
+    merged_news_items = merge_news_items(yfinance_news_items, finviz_news_items)
+
+    payload = {
+        "company": company,
+        "sector": sector,
+        "industry": industry,
+        "market_cap_raw": market_cap_raw,
+        "short_float_raw": short_float_raw,
+        "fallback_float_raw": fallback_float_raw,
+        "news_items": merged_news_items,
+        "finviz_news_items": finviz_news_items,
+        "yfinance_news_items": yfinance_news_items,
+        "fundamentals": fundamentals,
+    }
+
+    with NEWS_CACHE_LOCK:
+        NEWS_CACHE[ticker] = {"created_at": time.time(), "payload": payload}
+
+    return payload
+
+
+def scan_premarket_gappers() -> pd.DataFrame:
     query = (
         Query()
-        .select(*columns)
+        .select(
+            "name",
+            "close",
+            "premarket_change",
+            "premarket_gap",
+            "premarket_volume",
+            "premarket_close",
+            "float_shares_outstanding_current",
+            "exchange",
+            "type",
+        )
         .where2(
             And(
-                Or(Column("premarket_change") >= min_gap_pct, Column("premarket_change") <= -min_gap_pct),
                 Column("premarket_change").not_empty(),
                 Column("premarket_volume").not_empty(),
-                Column("premarket_volume") >= int(min_volume),
-                Column("premarket_close").between(min_price, max_price),
+                Column("premarket_volume") >= MIN_PREMARKET_VOLUME,
+                Column("premarket_close") >= MIN_PRICE,
+                Column("premarket_change") >= MIN_PREMARKET_PCT,
+                Column("market_cap_basic") > MIN_MARKET_CAP,
                 Column("exchange").isin(EXCHANGES),
                 Column("type") == "stock",
             )
         )
-        .order_by("premarket_volume", ascending=False)
-        .limit(limit)
+        .order_by("premarket_change", ascending=False)
+        .limit(SCAN_LIMIT)
     )
 
     _, raw = query.get_scanner_data(**tradingview_request_kwargs())
@@ -1813,788 +2409,2450 @@ def scan_premarket_gappers(
 
     frame = raw.copy()
     frame["ticker"] = frame["ticker"].astype(str).str.split(":").str[-1]
-    frame["premarket_change"] = pd.to_numeric(frame["premarket_change"], errors="coerce")
-    frame["premarket_volume"] = pd.to_numeric(frame["premarket_volume"], errors="coerce").fillna(0).astype("int64")
-    frame["premarket_close"] = pd.to_numeric(frame["premarket_close"], errors="coerce")
-    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-    frame["float_shares_outstanding_current"] = pd.to_numeric(
-        frame["float_shares_outstanding_current"],
-        errors="coerce",
-    )
-    frame["EMA10"] = pd.to_numeric(frame["EMA10"], errors="coerce")
-    frame["EMA20"] = pd.to_numeric(frame["EMA20"], errors="coerce")
-    frame["SMA50"] = pd.to_numeric(frame["SMA50"], errors="coerce")
+    frame["company_name"] = frame["name"].astype(str)
+    for column in [
+        "close",
+        "premarket_change",
+        "premarket_gap",
+        "premarket_volume",
+        "premarket_close",
+        "float_shares_outstanding_current",
+    ]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    frame["premarket_volume"] = frame["premarket_volume"].fillna(0).astype("int64")
     frame["display_price"] = frame["premarket_close"].fillna(frame["close"])
     return frame
 
 
-_ENRICHED_COLUMNS = [
-    "all_time_high_volume", "volume_ratio", "is_volume_breaker", "flag",
-    "catalyst_summary", "event_label", "direction", "headlines",
-    "short_float_str", "market_cap", "sector", "edge",
-    "catalyst_quality", "catalyst_quality_reason",
-    "why_today", "story_before", "story_after",
-    "mechanism", "float_analysis",
-    "bullish", "bearish",
-    "key_uncertainty",
-    "catalyst_durability", "catalyst_durability_reason",
-    "dilution_risk",
-    "trade_structure", "trade_structure_reason",
-    "entry_thesis", "invalidation",
-    "rerating", "rerating_reason",
-    "grade",
-]
+def scan_watchlist_symbols(symbols: list[str]) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame()
 
+    query = (
+        Query()
+        .select(
+            "name",
+            "close",
+            "change",
+            "volume",
+            "market_cap_basic",
+            "float_shares_outstanding_current",
+            "premarket_change",
+            "premarket_volume",
+            "premarket_close",
+            "exchange",
+            "type",
+        )
+        .set_tickers(*symbols)
+        .limit(len(symbols))
+    )
 
-def enrich_scan(frame: pd.DataFrame) -> pd.DataFrame:
+    _, frame = query.get_scanner_data(**tradingview_request_kwargs())
     if frame.empty:
-        # Return an empty DataFrame that still has all expected columns so
-        # downstream column accesses never raise KeyError.
-        empty = frame.copy()
-        for col in _ENRICHED_COLUMNS:
-            if col not in empty.columns:
-                empty[col] = pd.Series(dtype=object)
-        return empty
+        return pd.DataFrame()
 
-    base_rows = [
-        {
-            "ticker": row.ticker,
-            "premarket_volume": int(row.premarket_volume),
-            "display_price": row.display_price,
-            "EMA10": row.EMA10,
-            "EMA20": row.EMA20,
-            "SMA50": row.SMA50,
-            "premarket_change": row.premarket_change,
-            "float_shares_outstanding_current": row.float_shares_outstanding_current,
-        }
-        for row in frame.itertuples(index=False)
-    ]
-    enrichments: dict[str, dict[str, Any]] = {}
-
-    workers = max(1, min(8, len(base_rows)))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(enrich_ticker, row): row["ticker"] for row in base_rows}
-        for future in as_completed(futures):
-            ticker = futures[future]
-            try:
-                enrichments[ticker] = future.result()
-            except Exception as exc:  # pragma: no cover
-                enrichments[ticker] = {
-                    "all_time_high_volume": None,
-                    "volume_ratio": None,
-                    "is_volume_breaker": False,
-                    "flag": "",
-                    "catalyst_summary": f"Enrichment failed: {exc}",
-                    "event_label": "Headline",
-                    "direction": "mixed",
-                    "headlines": [],
-                    "short_float_str": None,
-                    "market_cap": None,
-                    "sector": "",
-                    "edge": "",
-                    "catalyst_quality": "",
-                    "catalyst_quality_reason": "",
-                    "why_today": "",
-                    "story_before": "",
-                    "story_after": "",
-                    "mechanism": "",
-                    "float_analysis": "",
-                    "bullish": [],
-                    "bearish": [],
-                    "key_uncertainty": "",
-                    "catalyst_durability": "",
-                    "catalyst_durability_reason": "",
-                    "dilution_risk": "",
-                    "trade_structure": "",
-                    "trade_structure_reason": "",
-                    "entry_thesis": "",
-                    "invalidation": "",
-                    "rerating": "",
-                    "rerating_reason": "",
-                }
-
-    enriched = frame.copy()
-    enriched["all_time_high_volume"] = enriched["ticker"].map(
-        lambda ticker: enrichments.get(ticker, {}).get("all_time_high_volume")
-    )
-    enriched["volume_ratio"] = enriched["ticker"].map(
-        lambda ticker: enrichments.get(ticker, {}).get("volume_ratio")
-    )
-    enriched["is_volume_breaker"] = enriched["ticker"].map(
-        lambda ticker: enrichments.get(ticker, {}).get("is_volume_breaker", False)
-    )
-    enriched["flag"] = enriched["ticker"].map(lambda ticker: enrichments.get(ticker, {}).get("flag", ""))
-    enriched["catalyst_summary"] = enriched["ticker"].map(
-        lambda ticker: enrichments.get(ticker, {}).get("catalyst_summary", "No catalyst.")
-    )
-    enriched["event_label"] = enriched["ticker"].map(
-        lambda ticker: enrichments.get(ticker, {}).get("event_label", "Headline")
-    )
-    enriched["direction"] = enriched["ticker"].map(
-        lambda ticker: enrichments.get(ticker, {}).get("direction", "mixed")
-    )
-    enriched["headlines"] = enriched["ticker"].map(
-        lambda ticker: enrichments.get(ticker, {}).get("headlines", [])
-    )
-    enriched["short_float_str"] = enriched["ticker"].map(
-        lambda ticker: enrichments.get(ticker, {}).get("short_float_str")
-    )
-    enriched["market_cap"] = enriched["ticker"].map(
-        lambda ticker: enrichments.get(ticker, {}).get("market_cap")
-    )
-    enriched["sector"] = enriched["ticker"].map(
-        lambda ticker: enrichments.get(ticker, {}).get("sector", "")
-    )
-    enriched["edge"] = enriched["ticker"].map(
-        lambda ticker: enrichments.get(ticker, {}).get("edge", "")
-    )
-    for col, default in [
-        ("catalyst_quality", ""),
-        ("catalyst_quality_reason", ""),
-        ("why_today", ""),
-        ("story_before", ""),
-        ("story_after", ""),
-        ("mechanism", ""),
-        ("float_analysis", ""),
-        ("bullish", []),
-        ("bearish", []),
-        ("key_uncertainty", ""),
-        ("catalyst_durability", ""),
-        ("catalyst_durability_reason", ""),
-        ("dilution_risk", ""),
-        ("trade_structure", ""),
-        ("trade_structure_reason", ""),
-        ("entry_thesis", ""),
-        ("invalidation", ""),
-        ("rerating", ""),
-        ("rerating_reason", ""),
+    output = frame.copy()
+    output["company_name"] = output["name"].astype(str)
+    for column in [
+        "close",
+        "change",
+        "volume",
+        "market_cap_basic",
+        "float_shares_outstanding_current",
+        "premarket_change",
+        "premarket_volume",
+        "premarket_close",
     ]:
-        _col, _def = col, default
-        enriched[_col] = enriched["ticker"].map(
-            lambda t, c=_col, d=_def: enrichments.get(t, {}).get(c, d)
-        )
-    enriched["grade"] = enriched.apply(
-        lambda row: compute_grade(row["display_price"], row["EMA10"], row["EMA20"], row["SMA50"]),
-        axis=1,
-    )
-    enriched["abs_gap"] = enriched["premarket_change"].abs()
-    enriched["sort_ratio"] = enriched["volume_ratio"].fillna(-1)
-    return enriched.sort_values(
-        by=["is_volume_breaker", "sort_ratio", "abs_gap", "premarket_volume"],
-        ascending=[False, False, False, False],
-    ).reset_index(drop=True)
+        output[column] = pd.to_numeric(output[column], errors="coerce")
+
+    output["volume"] = output["volume"].fillna(0).astype("int64")
+    output["premarket_volume"] = output["premarket_volume"].fillna(0).astype("int64")
+    output["display_price"] = output["premarket_close"].fillna(output["close"])
+    return output
 
 
-def apply_filters(frame: pd.DataFrame, min_float_shares: float, volume_breaker_only: bool) -> pd.DataFrame:
-    filtered = frame.copy()
-    if min_float_shares > 0:
-        filtered = filtered[filtered["float_shares_outstanding_current"].fillna(-1) >= min_float_shares]
-    if volume_breaker_only:
-        filtered = filtered[filtered["is_volume_breaker"]]
-    return filtered.reset_index(drop=True)
+def make_multichart_url(symbols: list[str], timeframe: str = "D") -> str:
+    cleaned_symbols = [clean_symbol(symbol) for symbol in symbols if clean_symbol(symbol)]
+    return f"{IB_CHART_BASE_URL}?symbols={quote(','.join(cleaned_symbols), safe=',')}&tf={quote(timeframe)}"
 
 
-def sync_auto_watchlist(frame: pd.DataFrame) -> int:
-    if frame.empty:
-        return 0
+def choose_watchlist_move(record: dict[str, Any]) -> dict[str, Any]:
+    day_change = finite_float(record.get("change"), default=0.0)
+    day_volume = finite_int(record.get("volume"), default=0)
+    premarket_change = finite_float(record.get("premarket_change"), default=0.0)
+    premarket_volume = finite_int(record.get("premarket_volume"), default=0)
 
-    added = 0
-    for row in frame[frame["is_volume_breaker"]].itertuples(index=False):
-        added_now = add_watchlist_item(
-            ticker=row.ticker,
-            catalyst=row.catalyst_summary,
-            price=float(row.display_price) if not pd.isna(row.display_price) else None,
-            gap_pct=float(row.premarket_change) if not pd.isna(row.premarket_change) else None,
-            source="auto-volume-breaker",
-        )
-        if added_now:
-            added += 1
-    return added
+    use_premarket = premarket_volume >= 10_000 and abs(premarket_change) >= max(1.0, abs(day_change) + 0.5)
+    if use_premarket:
+        return {"label": "Premarket move", "percent": premarket_change, "volume": premarket_volume, "session": "premarket"}
+    return {"label": "Day move", "percent": day_change, "volume": day_volume, "session": "regular"}
 
 
-def render_auto_refresh(enabled: bool, premarket_only: bool) -> None:
-    if not enabled or not premarket_only:
-        return
-    components.html(
-        f"""
-        <script>
-        setTimeout(function() {{
-            window.parent.location.reload();
-        }}, {AUTO_REFRESH_SECONDS * 1000});
-        </script>
-        """,
-        height=0,
-    )
+def row_analysis_bundle(row: dict[str, Any]) -> dict[str, Any]:
+    primary_news = None
+    if safe_text(row.get("primary_headline_title")):
+        primary_news = {
+            "title": safe_text(row.get("primary_headline_title")),
+            "source": safe_text(row.get("primary_headline_source")),
+            "url": safe_text(row.get("primary_headline_url")),
+            "time": safe_text(row.get("primary_headline_time")),
+        }
 
-
-def render_header() -> None:
-    st.markdown(
-        f"""
-        <div class="app-hero">
-            <div class="eyebrow">Live Premarket Workflow</div>
-            <div class="hero-title">{html.escape(APP_TITLE)}</div>
-            <p class="hero-subtitle">{html.escape(APP_SUBTITLE)}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_metrics(scan_count: int, breaker_count: int, watchlist_count: int, session_label: str) -> None:
-    now_text = now_et().strftime("%b %d, %Y %I:%M:%S %p ET")
-    cols = st.columns(4)
-    cards = [
-        ("Scanner Hits", str(scan_count), "Current names passing the live premarket filters."),
-        ("Volume Breakers", str(breaker_count), "Names already within 20% of all-time daily volume."),
-        ("My Watchlist", str(watchlist_count), "Locally persisted watchlist entries in watchlist.json."),
-        ("Session", session_label, now_text),
-    ]
-    for col, (label, value, note) in zip(cols, cards):
-        with col:
-            st.markdown(
-                f"""
-                <div class="metric-card">
-                    <div class="metric-label">{html.escape(label)}</div>
-                    <div class="metric-value">{html.escape(value)}</div>
-                    <div class="metric-note">{html.escape(note)}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-
-def render_table_headers() -> None:
-    headers = [
-        "Ticker",
-        "%Chg",
-        "Price",
-        "Volume (pre)",
-        "Float",
-        "All-Time High Vol",
-        "Vol Ratio",
-        "Catalyst/Reason",
-        "Grade",
-        "Action",
-    ]
-    widths = [1.0, 0.8, 0.8, 1.0, 0.9, 1.15, 0.95, 3.4, 0.7, 1.2]
-    columns = st.columns(widths)
-    for column, label in zip(columns, headers):
-        with column:
-            st.markdown(f'<div class="table-header">{html.escape(label)}</div>', unsafe_allow_html=True)
-
-
-def render_catalyst_html(
-    event_label: str,
-    direction: str,
-    headlines: list[dict[str, str]],
-    short_float_str: str | None,
-    market_cap: str | None,
-    sector: str,
-    edge: str,
-    catalyst_quality: str,
-    catalyst_quality_reason: str,
-    story_after: str,
-    bullish: list[str],
-    bearish: list[str],
-    trade_structure: str,
-    rerating: str,
-) -> str:
-    """Compact summary cell — headline, quality, story_after preview, quick badges."""
-    event_css = {
-        "M&A": "event-ma", "Earnings": "event-earnings", "Clinical": "event-clinical",
-        "Commercial": "event-commercial", "Product": "event-product",
-        "Analyst": "event-analyst", "Financing": "event-financing", "Legal": "event-legal",
-    }.get(event_label, "event-default")
-    dir_css  = {"positive": "dir-up", "negative": "dir-down", "mixed": "dir-mixed"}.get(direction, "dir-mixed")
-    dir_icon = {"positive": "↑", "negative": "↓", "mixed": "~"}.get(direction, "~")
-    dir_label = {"positive": "Bullish", "negative": "Bearish", "mixed": "Mixed"}.get(direction, "Mixed")
-    cq_lower = catalyst_quality.lower()
-    cq_css  = "cq-high" if "high" in cq_lower else ("cq-medium" if "medium" in cq_lower else "cq-low")
-    cq_icon = "◆" if "high" in cq_lower else ("◇" if "medium" in cq_lower else "○")
-
-    lines = []
-
-    # Tag row
-    tag_row = (f'<div class="catalyst-tags">'
-               f'<span class="event-badge {event_css}">{html.escape(event_label)}</span>'
-               f'<span class="dir-badge {dir_css}">{dir_icon} {html.escape(dir_label)}</span>')
-    if catalyst_quality:
-        tag_row += f'<span class="cq-badge {cq_css}">{cq_icon} {html.escape(catalyst_quality)}</span>'
-    tag_row += '</div>'
-    lines.append(tag_row)
-
-    # Quality reason
-    if catalyst_quality_reason:
-        lines.append(f'<div class="cq-reason">{html.escape(catalyst_quality_reason)}</div>')
-
-    # Top headline (linked)
-    if headlines:
-        item = headlines[0]
-        title = html.escape(item.get("title", ""))
-        link  = html.escape(item.get("link", ""))
-        src   = html.escape(item.get("source", ""))
-        ts    = html.escape(item.get("time", ""))
-        meta  = f' <span class="subtext">· {src} · {ts}</span>' if src or ts else ""
-        lines.append(
-            f'<div class="catalyst-headline">'
-            + (f'<a class="news-link" href="{link}" target="_blank">{title}</a>' if link else title)
-            + f'{meta}</div>'
-        )
-    else:
-        lines.append('<div class="catalyst-headline subtext">No catalyst headline found.</div>')
-
-    # Stats
-    stats = [s for s in [
-        f"Short: {short_float_str}" if short_float_str else None,
-        f"Cap: {market_cap}" if market_cap else None,
-        html.escape(sector) if sector else None,
-    ] if s]
-    if stats:
-        lines.append(f'<div class="catalyst-stats">{" · ".join(stats)}</div>')
-
-    # Story preview (first 2 sentences)
-    if story_after:
-        preview = ". ".join(story_after.split(". ")[:2])
-        if not preview.endswith("."):
-            preview += "…"
-        lines.append(f'<div class="catalyst-story">{html.escape(preview)}</div>')
-
-    # Compact bull/bear counts + trade structure badge
-    footer_parts = []
-    if bullish:
-        footer_parts.append(f'<span class="cq-badge cq-high">↑ {len(bullish)} bull</span>')
-    if bearish:
-        footer_parts.append(f'<span class="cq-badge cq-low">↓ {len(bearish)} bear</span>')
-    if trade_structure:
-        ts_l = trade_structure.lower()
-        ts_css = "ts-go" if "go" in ts_l else ("ts-fade" if "fade" in ts_l else "ts-multi")
-        ts_txt = "Gap-and-Go" if "go" in ts_l else ("Gap-and-Fade" if "fade" in ts_l else "Multi-Day")
-        footer_parts.append(f'<span class="ts-badge {ts_css}" style="font-size:0.66rem;padding:0.14rem 0.4rem;">{ts_txt}</span>')
-    if rerating:
-        r_l = rerating.lower()
-        r_css2 = "cq-high" if r_l.startswith("yes") else ("cq-medium" if r_l.startswith("partial") else "")
-        r_label = rerating.split("|")[0].strip().split()[0]
-        if r_css2:
-            footer_parts.append(f'<span class="cq-badge {r_css2}" style="font-size:0.66rem;">Re-rate: {html.escape(r_label)}</span>')
-    if footer_parts:
-        lines.append(f'<div style="display:flex;flex-wrap:wrap;gap:0.25rem;margin-top:0.25rem;">{"".join(footer_parts)}</div>')
-
-    # Fallback when no API key
-    if not story_after and edge:
-        lines.append(f'<div class="catalyst-edge">↳ {html.escape(edge)}</div>')
-        lines.append('<div class="no-api-note">Set ANTHROPIC_API_KEY for full analyst breakdown.</div>')
-
-    return f'<div class="catalyst-wrap">{"".join(lines)}</div>'
-
-
-def render_deep_analysis(row: Any) -> None:
-    """Full Streamlit expander with the 14-field deep-dive per ticker."""
-    has_llm = bool(getattr(row, "story_after", ""))
-
-    with st.expander(f"📊 Full Analysis — {row.ticker}", expanded=False):
-        if not has_llm:
-            st.caption("Set `ANTHROPIC_API_KEY` and refresh to see the full analyst breakdown.")
-            return
-
-        col_l, col_r = st.columns([1, 1])
-
-        with col_l:
-            # Why Today
-            if row.why_today:
-                st.markdown(
-                    f'<div class="deep-section">'
-                    f'<div class="deep-label">⚡ Why Today</div>'
-                    f'<div class="deep-text">{html.escape(row.why_today)}</div>'
-                    f'</div>', unsafe_allow_html=True)
-
-            # Narrative shift
-            if row.story_before or row.story_after:
-                st.markdown(
-                    f'<div class="deep-section">'
-                    f'<div class="deep-label">📖 Narrative Shift</div>'
-                    + (f'<div class="deep-story-before"><b style="color:#5a7a99;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Before</b><br>{html.escape(row.story_before)}</div>' if row.story_before else "")
-                    + (f'<div class="deep-story-after"><b style="color:#4a8fc4;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">After</b><br>{html.escape(row.story_after)}</div>' if row.story_after else "")
-                    + '</div>', unsafe_allow_html=True)
-
-            # Market mechanism
-            if row.mechanism:
-                st.markdown(
-                    f'<div class="deep-section">'
-                    f'<div class="deep-label">⚙ Market Mechanism</div>'
-                    f'<div class="deep-text">{html.escape(row.mechanism)}</div>'
-                    f'</div>', unsafe_allow_html=True)
-
-            # Float analysis
-            if row.float_analysis:
-                st.markdown(
-                    f'<div class="deep-section">'
-                    f'<div class="deep-label">🔢 Float Analysis</div>'
-                    f'<div class="deep-float-block">{html.escape(row.float_analysis)}</div>'
-                    f'</div>', unsafe_allow_html=True)
-
-            # Key uncertainty
-            if row.key_uncertainty:
-                st.markdown(
-                    f'<div class="deep-section">'
-                    f'<div class="deep-label">❓ Key Uncertainty</div>'
-                    f'<div class="deep-uncertainty">{html.escape(row.key_uncertainty)}</div>'
-                    f'</div>', unsafe_allow_html=True)
-
-        with col_r:
-            # Bull case
-            if row.bullish:
-                items_html = "".join(f'<div class="bb-item-wide">{html.escape(p)}</div>' for p in row.bullish)
-                st.markdown(
-                    f'<div class="deep-section">'
-                    f'<div class="deep-label" style="color:var(--green);">↑ Bull Case ({len(row.bullish)} arguments)</div>'
-                    f'<div class="bb-block bb-block-wide bull">{items_html}</div>'
-                    f'</div>', unsafe_allow_html=True)
-
-            # Bear case
-            if row.bearish:
-                items_html = "".join(f'<div class="bb-item-wide">{html.escape(p)}</div>' for p in row.bearish)
-                st.markdown(
-                    f'<div class="deep-section">'
-                    f'<div class="deep-label" style="color:var(--red);">↓ Bear Risks ({len(row.bearish)} risks)</div>'
-                    f'<div class="bb-block bb-block-wide bear">{items_html}</div>'
-                    f'</div>', unsafe_allow_html=True)
-
-            # Catalyst durability
-            if row.catalyst_durability:
-                st.markdown(
-                    f'<div class="deep-section">'
-                    f'<div class="deep-label">⏱ Catalyst Durability</div>'
-                    f'<span class="durability-badge">{html.escape(row.catalyst_durability)}</span>'
-                    + (f'<span class="deep-text-muted">{html.escape(row.catalyst_durability_reason)}</span>' if row.catalyst_durability_reason else "")
-                    + '</div>', unsafe_allow_html=True)
-
-            # Dilution risk
-            if row.dilution_risk:
-                dil_lower = row.dilution_risk.lower()
-                dil_css = "" if any(w in dil_lower for w in ["high", "medium"]) else "safe"
-                st.markdown(
-                    f'<div class="deep-section">'
-                    f'<div class="deep-label">⚠ Dilution Risk</div>'
-                    f'<div class="deep-dilution {dil_css}">{html.escape(row.dilution_risk)}</div>'
-                    f'</div>', unsafe_allow_html=True)
-
-            # Trade structure
-            if row.trade_structure:
-                ts_l = row.trade_structure.lower()
-                ts_css = "ts-go" if "go" in ts_l else ("ts-fade" if "fade" in ts_l else "ts-multi")
-                ts_txt = "Gap-and-Go" if "go" in ts_l else ("Gap-and-Fade" if "fade" in ts_l else "Multi-Day Setup")
-                st.markdown(
-                    f'<div class="deep-section">'
-                    f'<div class="deep-label">📐 Trade Structure</div>'
-                    f'<div class="trade-structure-row">'
-                    f'<span class="ts-badge {ts_css}">{ts_txt}</span>'
-                    + (f'<span class="ts-reason">{html.escape(row.trade_structure_reason)}</span>' if row.trade_structure_reason else "")
-                    + '</div></div>', unsafe_allow_html=True)
-
-        # Entry + Invalidation full width
-        if row.entry_thesis or row.invalidation:
-            c1, c2 = st.columns(2)
-            with c1:
-                if row.entry_thesis:
-                    st.markdown(
-                        f'<div class="deep-section">'
-                        f'<div class="deep-label" style="color:var(--green);">✅ Entry Thesis</div>'
-                        f'<div class="deep-entry">{html.escape(row.entry_thesis)}</div>'
-                        f'</div>', unsafe_allow_html=True)
-            with c2:
-                if row.invalidation:
-                    st.markdown(
-                        f'<div class="deep-section">'
-                        f'<div class="deep-label" style="color:var(--red);">🚫 Invalidation</div>'
-                        f'<div class="deep-invalidation">{html.escape(row.invalidation)}</div>'
-                        f'</div>', unsafe_allow_html=True)
-
-        # Re-rating full width
-        if row.rerating:
-            r_lower = row.rerating.lower()
-            r_css = "rerating-yes" if r_lower.startswith("yes") else ("rerating-partial" if r_lower.startswith("partial") else "rerating-no")
-            r_label = row.rerating.split("|")[0].strip().split()[0]
-            st.markdown(
-                f'<div class="deep-section">'
-                f'<div class="deep-label">🏷 Re-rating Verdict</div>'
-                f'<div class="catalyst-rerating {r_css}">'
-                f'<span class="rerating-label">Re-rating: {html.escape(r_label)}</span>'
-                f'<span class="rerating-reason-text">{html.escape(row.rerating_reason)}</span>'
-                f'</div></div>', unsafe_allow_html=True)
-
-
-def render_scan_table(frame: pd.DataFrame, table_key: str) -> None:
-    if frame.empty:
-        st.info("No stocks are currently matching the selected scanner filters.")
-        return
-
-    render_table_headers()
-    widths = [1.0, 0.8, 0.8, 1.0, 0.9, 1.15, 0.95, 3.4, 0.7, 1.2]
-
-    for row in frame.itertuples(index=False):
-        columns = st.columns(widths)
-
-        with columns[0]:
-            st.markdown(
-                f"""
-                <div class="cell ticker">{html.escape(row.ticker)}</div>
-                <div class="subtext">{html.escape(str(row.exchange))}</div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        with columns[1]:
-            st.markdown(f'<div class="cell">{format_gap_html(row.premarket_change)}</div>', unsafe_allow_html=True)
-
-        with columns[2]:
-            st.markdown(f'<div class="cell">{html.escape(format_price(row.display_price))}</div>', unsafe_allow_html=True)
-
-        with columns[3]:
-            st.markdown(
-                f'<div class="cell">{html.escape(compact_number(row.premarket_volume))}</div>',
-                unsafe_allow_html=True,
-            )
-
-        with columns[4]:
-            st.markdown(
-                f'<div class="cell">{html.escape(compact_number(row.float_shares_outstanding_current))}</div>',
-                unsafe_allow_html=True,
-            )
-
-        with columns[5]:
-            st.markdown(
-                f'<div class="cell">{html.escape(compact_number(row.all_time_high_volume))}</div>',
-                unsafe_allow_html=True,
-            )
-
-        with columns[6]:
-            badge = f'<div class="breaker-badge">{html.escape(row.flag)}</div>' if row.is_volume_breaker else ""
-            css = "value-orange" if row.is_volume_breaker else ""
-            st.markdown(
-                f'<div class="cell {css}">{html.escape(format_ratio(row.volume_ratio))}</div>{badge}',
-                unsafe_allow_html=True,
-            )
-
-        with columns[7]:
-            st.markdown(
-                render_catalyst_html(
-                    event_label=row.event_label,
-                    direction=row.direction,
-                    headlines=row.headlines,
-                    short_float_str=row.short_float_str,
-                    market_cap=row.market_cap,
-                    sector=row.sector,
-                    edge=row.edge,
-                    catalyst_quality=row.catalyst_quality,
-                    catalyst_quality_reason=row.catalyst_quality_reason,
-                    story_after=row.story_after,
-                    bullish=row.bullish,
-                    bearish=row.bearish,
-                    trade_structure=row.trade_structure,
-                    rerating=row.rerating,
-                ),
-                unsafe_allow_html=True,
-            )
-
-        # Full deep-dive expander below each row (full width)
-        render_deep_analysis(row)
-
-        with columns[8]:
-            st.markdown(f'<div class="cell">{grade_html(row.grade)}</div>', unsafe_allow_html=True)
-
-        with columns[9]:
-            if st.button(
-                "Add to My Watchlist",
-                key=f"{table_key}-add-{row.ticker}",
-                use_container_width=True,
-                type="secondary",
-            ):
-                was_added = add_watchlist_item(
-                    ticker=row.ticker,
-                    catalyst=row.catalyst_summary,
-                    price=float(row.display_price) if not pd.isna(row.display_price) else None,
-                    gap_pct=float(row.premarket_change) if not pd.isna(row.premarket_change) else None,
-                    source="manual",
-                )
-                st.toast(f'{"Added" if was_added else "Updated"} {row.ticker} in watchlist.')
-                st.rerun()
-
-
-def render_sidebar(watchlist_items: list[dict[str, Any]]) -> dict[str, Any]:
-    st.sidebar.markdown("## Scanner Controls")
-    min_gap_pct = st.sidebar.slider("Min % gap", min_value=1.0, max_value=50.0, value=8.0, step=0.5)
-    min_volume = int(
-        st.sidebar.number_input("Min premarket volume", min_value=0, value=500_000, step=100_000)
-    )
-    min_float_millions = st.sidebar.number_input(
-        "Min float (millions of shares)",
-        min_value=0.0,
-        value=0.0,
-        step=1.0,
-        format="%.1f",
-    )
-    volume_breaker_only = st.sidebar.toggle("Volume Breaker only", value=False)
-    auto_refresh = st.sidebar.toggle("Auto-refresh every 60s", value=True)
-    scan_limit = int(
-        st.sidebar.slider("Max rows", min_value=10, max_value=MAX_SCAN_LIMIT, value=DEFAULT_SCAN_LIMIT, step=5)
-    )
-    st.sidebar.button("Refresh Scan", type="primary", use_container_width=True)
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("## AI Analyst (Claude)")
-    has_api_key = bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
-    if has_api_key:
-        st.sidebar.success("Claude API key detected — full analyst breakdown enabled.", icon="✅")
-    else:
-        st.sidebar.warning(
-            "Set `ANTHROPIC_API_KEY` in your environment to enable the AI story, bull/bear case, and re-rating analysis per stock.\n\n"
-            "```\nexport ANTHROPIC_API_KEY=sk-ant-...\nstreamlit run app.py\n```",
-            icon="🔑",
-        )
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("## My Watchlist")
-    st.sidebar.caption(
-        "Volume breaker names are auto-added when they first hit the trigger. "
-        "If they keep triggering, they can reappear after removal on a later refresh."
-    )
-
-    if watchlist_items:
-        st.sidebar.download_button(
-            "Export Watchlist CSV",
-            data=export_watchlist_csv(watchlist_items),
-            file_name="watchlist.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-        for item in watchlist_items:
-            ticker = str(item.get("ticker", ""))
-            source = str(item.get("source", "manual")).replace("-", " ").title()
-            timestamp = str(item.get("timestamp", ""))[:19].replace("T", " ")
-            st.sidebar.markdown(
-                f"""
-                <div class="sidebar-watch-card">
-                    <div class="sidebar-watch-ticker">{html.escape(ticker)}</div>
-                    <div class="sidebar-watch-meta">{html.escape(source)} | {html.escape(timestamp)}</div>
-                    <div class="sidebar-watch-meta">{html.escape(str(item.get("catalyst", ""))[:120])}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if st.sidebar.button(f"Remove {ticker}", key=f"remove-{ticker}", use_container_width=True):
-                remove_watchlist_item(ticker)
-                st.toast(f"Removed {ticker} from watchlist.")
-                st.rerun()
-    else:
-        st.sidebar.info("Your watchlist is empty.")
+    supporting_news = None
+    if safe_text(row.get("supporting_headline_title")):
+        supporting_news = {
+            "title": safe_text(row.get("supporting_headline_title")),
+            "source": safe_text(row.get("supporting_headline_source")),
+            "url": safe_text(row.get("supporting_headline_url")),
+            "time": safe_text(row.get("supporting_headline_time")),
+        }
 
     return {
-        "min_gap_pct": min_gap_pct,
-        "min_volume": min_volume,
-        "min_float_shares": min_float_millions * 1_000_000,
-        "volume_breaker_only": volume_breaker_only,
-        "auto_refresh": auto_refresh,
-        "scan_limit": scan_limit,
+        "company": row.get("company_name"),
+        "sector": row.get("sector"),
+        "industry": row.get("industry"),
+        "market_cap_raw": row.get("market_cap"),
+        "short_float_raw": row.get("short_display"),
+        "news_items": row.get("news_items", []),
+        "primary_news": primary_news,
+        "primary_headline_title": row.get("primary_headline_title", ""),
+        "primary_headline_source": row.get("primary_headline_source", ""),
+        "primary_relevance": row.get("primary_relevance", "none"),
+        "primary_category": row.get("primary_category", row.get("category", "No Fresh News")),
+        "supporting_news": supporting_news,
+        "supporting_headline_title": row.get("supporting_headline_title", ""),
+        "supporting_headline_source": row.get("supporting_headline_source", ""),
+        "peer_context": row.get("peer_context"),
+        "event_context_titles": row.get("event_context_titles", []),
     }
 
 
-def main() -> None:
-    inject_css()
-    render_header()
+def row_direct_catalyst_score(row: dict[str, Any]) -> float:
+    title = safe_text(row.get("primary_headline_title"))
+    category = safe_text(row.get("primary_category")) or safe_text(row.get("category"))
+    relevance = safe_text(row.get("primary_relevance"))
+    score = 0.0
 
-    session_label, is_premarket = market_session_status()
-    watchlist_items = load_watchlist()
-    controls = render_sidebar(watchlist_items)
-    render_auto_refresh(controls["auto_refresh"], is_premarket)
+    if relevance == "direct":
+        score += 12
+    elif relevance == "indirect":
+        score += 4
 
-    if not os.getenv("TRADINGVIEW_COOKIES_JSON"):
-        st.markdown(
-            """
-            <div class="warning-note">
-            TradingView scan is running on an anonymous session. Premarket fields will still load,
-            but they can be delayed versus an authenticated TradingView session.
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    score += {
+        "Earnings": 10,
+        "FDA / Clinical": 10,
+        "M&A / Rumor": 9,
+        "PR / Contract": 8,
+        "Financing / Offering": 7,
+        "Analyst / Upgrade": 5,
+        "Sympathy / Sector": 2,
+        "Low Float Momentum": 1,
+        "No Fresh News": 0,
+    }.get(category, 0)
 
-    with st.spinner("Scanning TradingView premarket gappers and enriching catalyst + volume history..."):
-        scan_error = None
-        try:
-            scanned = scan_premarket_gappers(
-                min_gap_pct=controls["min_gap_pct"],
-                min_volume=controls["min_volume"],
-                min_price=1,
-                max_price=200,
-                limit=controls["scan_limit"],
+    if is_concrete_event_headline(title):
+        score += 6
+    if is_commentary_headline(title):
+        score -= 6
+
+    financing_flavor = financing_flavor_from_headline(title)
+    if category == "Financing / Offering":
+        if financing_flavor == "strategic":
+            score += 5
+        elif financing_flavor == "dilutive":
+            score -= 8
+
+    score += min(float(row.get("premarket_percent") or 0.0) / 10.0, 4.0)
+    score += min(int(row.get("premarket_volume") or 0) / 1_000_000.0, 4.0)
+    return score
+
+
+def row_can_anchor_sector_rerating(row: dict[str, Any]) -> bool:
+    category = safe_text(row.get("primary_category")) or safe_text(row.get("category"))
+    title = safe_text(row.get("primary_headline_title"))
+    return (
+        safe_text(row.get("primary_relevance")) == "direct"
+        and category in DIRECT_CATALYST_CATEGORIES
+        and financing_flavor_from_headline(title) == "strategic"
+    )
+
+
+def news_mentions_peer(row: dict[str, Any], peer_row: dict[str, Any]) -> bool:
+    peer_tokens = {safe_text(peer_row.get("ticker")).lower(), *company_name_tokens(safe_text(peer_row.get("company_name")))}
+    peer_tokens = {token for token in peer_tokens if token}
+    if not peer_tokens:
+        return False
+
+    headline_text = " ".join(
+        clean_headline_text(item.get("title", "")).lower()
+        for item in row.get("news_items", [])[:5]
+    )
+    return any(token in headline_text for token in peer_tokens)
+
+
+def apply_sector_rerating_context(rows: list[dict[str, Any]]) -> None:
+    grouped_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        industry = safe_text(row.get("industry"))
+        if not industry or industry == "-":
+            continue
+        grouped_rows.setdefault(industry, []).append(row)
+
+    for group_rows in grouped_rows.values():
+        leader_candidates = [row for row in group_rows if row_can_anchor_sector_rerating(row)]
+        if not leader_candidates:
+            continue
+
+        leader = max(leader_candidates, key=row_direct_catalyst_score)
+        leader_score = row_direct_catalyst_score(leader)
+        leader_title = safe_text(leader.get("primary_headline_title"))
+
+        for row in group_rows:
+            if row is leader:
+                continue
+            if int(row.get("premarket_volume") or 0) < 300_000:
+                continue
+            if float(row.get("premarket_percent") or 0.0) <= 0:
+                continue
+
+            own_score = row_direct_catalyst_score(row)
+            standalone_category = safe_text(row.get("category")) or safe_text(row.get("primary_category"))
+            support_title = safe_text(row.get("supporting_headline_title")) or safe_text(row.get("primary_headline_title"))
+            has_support = (
+                safe_text(row.get("primary_relevance")) == "direct"
+                and bool(support_title)
+                and is_concrete_event_headline(support_title)
             )
-            enriched = enrich_scan(scanned)
-        except Exception as exc:
-            scan_error = str(exc)
-            enriched = pd.DataFrame()
+            peer_linked = news_mentions_peer(row, leader) or news_mentions_peer(leader, row)
 
-    if scan_error:
-        st.error(
-            "The scan failed on this refresh. This is usually a temporary TradingView, Yahoo, or Finviz "
-            f"request issue.\n\nDetails: {scan_error}"
+            if standalone_category in {"Earnings", "FDA / Clinical", "M&A / Rumor"} and not peer_linked:
+                continue
+            if float(row.get("premarket_percent") or 0.0) >= 20 and own_score >= leader_score - 2.0:
+                continue
+            if not peer_linked and own_score >= leader_score - 2.0:
+                continue
+            if not has_support and not peer_linked:
+                continue
+
+            row["standalone_category"] = standalone_category
+            row["peer_context"] = {
+                "kind": "sector_rerating",
+                "leader_ticker": leader.get("ticker"),
+                "leader_headline": leader_title,
+                "leader_category": leader.get("category"),
+                "support_headline": support_title,
+                "has_company_specific_support": has_support,
+            }
+            row["category"] = "Sympathy / Sector"
+
+            if row.get("ai_source") == "fallback":
+                bundle = row_analysis_bundle(row)
+                row["reasoning"] = build_fallback_reasoning(row, bundle, row["category"], row["grade"])
+                row["analysis_details"] = build_fallback_analysis(row, bundle, row["category"], row["grade"])
+
+
+def dedupe_headline_items(items: list[dict[str, str]], limit: int = 6) -> list[dict[str, str]]:
+    output: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        title = clean_headline_text(item.get("title", ""))
+        if not title:
+            continue
+        normalized = {
+            "title": title,
+            "source": safe_text(item.get("source")) or "Headline",
+            "url": safe_text(item.get("url")),
+            "time": safe_text(item.get("time")),
+            "published_at": safe_text(item.get("published_at")),
+        }
+        key = news_dedupe_key(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(normalized)
+        if len(output) >= limit:
+            break
+    return output
+
+
+def collect_top_headlines_from_rows(rows: list[dict[str, Any]], limit: int = 6) -> list[dict[str, str]]:
+    ranked_rows = sorted(
+        rows,
+        key=lambda item: (
+            row_direct_catalyst_score(item),
+            abs(row_move_percent(item)),
+            row_move_volume(item),
+        ),
+        reverse=True,
+    )
+    headline_items: list[dict[str, str]] = []
+    for row in ranked_rows:
+        if safe_text(row.get("primary_headline_title")):
+            headline_items.append(
+                {
+                    "title": safe_text(row.get("primary_headline_title")),
+                    "source": safe_text(row.get("primary_headline_source")),
+                    "url": safe_text(row.get("primary_headline_url")),
+                    "time": safe_text(row.get("primary_headline_time")),
+                }
+            )
+        if safe_text(row.get("supporting_headline_title")):
+            headline_items.append(
+                {
+                    "title": safe_text(row.get("supporting_headline_title")),
+                    "source": safe_text(row.get("supporting_headline_source")),
+                    "url": safe_text(row.get("supporting_headline_url")),
+                    "time": safe_text(row.get("supporting_headline_time")),
+                }
+            )
+        headline_items.extend(row.get("news_items", [])[:2])
+    return dedupe_headline_items(headline_items, limit=limit)
+
+
+def format_brief_movers(rows: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
+    ranked_rows = sorted(rows, key=lambda item: abs(row_move_percent(item)), reverse=True)[:limit]
+    return [
+        {
+            "ticker": row.get("ticker"),
+            "company_name": row.get("company_name"),
+            "move_label": row.get("move_label", "Move"),
+            "move_percent": round(row_move_percent(row), 2),
+            "category": row.get("category"),
+            "grade": row.get("grade"),
+            "reasoning": row.get("reasoning"),
+        }
+        for row in ranked_rows
+    ]
+
+
+def build_market_brief_section_prompt(
+    section_kind: str,
+    title: str,
+    headlines: list[dict[str, str]],
+    top_rows: list[dict[str, Any]],
+    extra_context: str = "",
+) -> str:
+    current_stamp = local_now().strftime("%Y-%m-%d %I:%M %p %Z")
+    headline_block = "\n".join(
+        f"{index}. [{item.get('time') or '-'}] {item.get('source') or 'Headline'}: {clean_headline_text(item.get('title', ''))}"
+        for index, item in enumerate(headlines, start=1)
+    ) or "No fresh headlines supplied."
+    movers_block = "\n".join(
+        f"- {row.get('ticker')}: {row_move_percent(row):+.1f}% on {compact_number(row_move_volume(row))}, "
+        f"{row.get('category', 'No Fresh News')} / {row.get('grade', 'D')} / {safe_text(row.get('reasoning'))}"
+        for row in top_rows[:5]
+    ) or "- No movers supplied."
+
+    return f"""
+You are an elite cross-asset market strategist writing a crisp premarket and sector brief for an active trader dashboard.
+Current local time: {current_stamp}
+
+Return ONLY valid JSON with exactly these keys:
+- summary
+- analysis_details
+- importance
+
+Rules:
+1. summary must be one sentence, plain English, max 32 words
+2. analysis_details must be 2-3 short paragraphs, no bullet points
+3. importance must be exactly one of: High, Medium, Low
+4. Focus on what is actually driving this section now: hard catalysts, sector rerating, financing spillover, macro pressure, positioning, or no clean driver
+5. If the headlines are commentary or stale, say so plainly
+6. Mention when the move looks driven by sympathy or tape instead of direct fundamental repricing
+
+Section kind: {section_kind}
+Section title: {title}
+
+Top movers:
+{movers_block}
+
+Headlines:
+{headline_block}
+
+Additional context:
+{extra_context or "-"}
+""".strip()
+
+
+def fallback_market_brief_section(
+    section_kind: str,
+    title: str,
+    headlines: list[dict[str, str]],
+    top_rows: list[dict[str, Any]],
+    error_text: str = "",
+) -> dict[str, str]:
+    lead_headline = clean_headline_text(headlines[0]["title"]) if headlines else "No fresh high-signal headline surfaced."
+    mover = top_rows[0] if top_rows else {}
+    move_clause = ""
+    if mover:
+        move_clause = (
+            f" {safe_text(mover.get('ticker'))} is the lead mover at {row_move_percent(mover):+.1f}%, "
+            f"which keeps {title.lower()} in play."
+        )
+    importance = "High" if section_kind in {"macro", "premarket"} or (mover and abs(row_move_percent(mover)) >= 8) else "Medium"
+    summary = f"{lead_headline[:120]} is setting the tone for {title.lower()}.{move_clause}".strip()
+    details = [
+        f"{title} is being framed mainly by {lead_headline.lower()}." if headlines else f"{title} does not have a clean fresh headline yet.",
+        "The current read leans on the strongest visible movers and the best-ranked merged headlines, so it is useful context but not as nuanced as the live model pass.",
+    ]
+    if error_text:
+        details.append(f"AI note: {error_text}")
+    return {
+        "summary": " ".join(summary.split())[:220],
+        "analysis_details": "\n\n".join(details),
+        "importance": importance,
+        "ai_source": "fallback",
+    }
+
+
+def normalize_market_brief_section_payload(
+    payload: dict[str, Any],
+    section_kind: str,
+    title: str,
+    headlines: list[dict[str, str]],
+    top_rows: list[dict[str, Any]],
+    provider: str | None = None,
+) -> dict[str, str]:
+    fallback = fallback_market_brief_section(section_kind, title, headlines, top_rows)
+    summary = " ".join(safe_text(payload.get("summary")).split()) or fallback["summary"]
+    analysis_details = safe_text(payload.get("analysis_details")) or fallback["analysis_details"]
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", analysis_details) if part.strip()]
+    analysis_details = "\n\n".join(paragraphs[:3]) if paragraphs else fallback["analysis_details"]
+    importance = safe_text(payload.get("importance")).title()
+    if importance not in {"High", "Medium", "Low"}:
+        importance = fallback["importance"]
+    return {
+        "summary": summary[:220],
+        "analysis_details": analysis_details,
+        "importance": importance,
+        "ai_source": provider or "fallback",
+    }
+
+
+def analyze_market_brief_section(
+    section_kind: str,
+    title: str,
+    headlines: list[dict[str, str]],
+    top_rows: list[dict[str, Any]],
+    extra_context: str = "",
+) -> dict[str, str]:
+    cache_key = json.dumps(
+        {
+            "version": AI_PROMPT_VERSION,
+            "section_kind": section_kind,
+            "title": title,
+            "headlines": [clean_headline_text(item.get("title", "")) for item in headlines],
+            "top_rows": [
+                {
+                    "ticker": row.get("ticker"),
+                    "move": round(row_move_percent(row), 2),
+                    "category": row.get("category"),
+                    "grade": row.get("grade"),
+                    "reasoning": row.get("reasoning"),
+                }
+                for row in top_rows[:5]
+            ],
+            "extra_context": extra_context,
+        },
+        sort_keys=True,
+    )
+    with MARKET_BRIEF_CACHE_LOCK:
+        cached = MARKET_BRIEF_CACHE.get(cache_key)
+        if cached and time.time() - cached["created_at"] < cached.get("ttl", ANALYSIS_CACHE_TTL_SECONDS):
+            return cached["payload"]
+
+    prompt = build_market_brief_section_prompt(section_kind, title, headlines, top_rows, extra_context=extra_context)
+    payload, provider, last_error = request_ai_json(prompt)
+    if payload is not None:
+        normalized = normalize_market_brief_section_payload(payload, section_kind, title, headlines, top_rows, provider=provider)
+    else:
+        normalized = fallback_market_brief_section(section_kind, title, headlines, top_rows, error_text=last_error)
+
+    with MARKET_BRIEF_CACHE_LOCK:
+        ttl = ANALYSIS_CACHE_TTL_SECONDS if normalized.get("ai_source") != "fallback" else 120
+        MARKET_BRIEF_CACHE[cache_key] = {"created_at": time.time(), "ttl": ttl, "payload": normalized}
+    return normalized
+
+
+def build_row_payload(record: dict[str, Any]) -> dict[str, Any]:
+    ticker = clean_symbol(record.get("ticker"))
+    finviz_bundle = fetch_finviz_bundle(ticker)
+    company_name = safe_text(finviz_bundle.get("company")) or safe_text(record.get("company_name") or record.get("name"))
+    primary_news = select_primary_news(
+        ticker,
+        company_name,
+        finviz_bundle.get("news_items", []),
+    )
+    supporting_news = select_supporting_news(
+        ticker,
+        company_name,
+        finviz_bundle.get("news_items", []),
+    )
+    event_context_news = select_event_context_news(finviz_bundle.get("news_items", []))
+    if primary_news:
+        remaining_news = [item for item in finviz_bundle.get("news_items", []) if item is not primary_news]
+        finviz_bundle["news_items"] = [primary_news] + remaining_news
+        finviz_bundle["primary_news"] = primary_news
+        finviz_bundle["primary_headline_title"] = clean_headline_text(primary_news.get("title", ""))
+        finviz_bundle["primary_headline_source"] = safe_text(primary_news.get("source", ""))
+        finviz_bundle["primary_headline_url"] = safe_text(primary_news.get("url", ""))
+        finviz_bundle["primary_headline_time"] = safe_text(primary_news.get("time", ""))
+        finviz_bundle["primary_relevance"] = infer_headline_relevance(
+            ticker,
+            company_name,
+            [primary_news],
+        )
+        finviz_bundle["primary_category"] = headline_category_guess(primary_news.get("title", ""))
+    else:
+        finviz_bundle["primary_news"] = None
+        finviz_bundle["primary_headline_title"] = ""
+        finviz_bundle["primary_headline_source"] = ""
+        finviz_bundle["primary_headline_url"] = ""
+        finviz_bundle["primary_headline_time"] = ""
+        finviz_bundle["primary_relevance"] = "none"
+        finviz_bundle["primary_category"] = "No Fresh News"
+
+    if supporting_news:
+        finviz_bundle["supporting_news"] = supporting_news
+        finviz_bundle["supporting_headline_title"] = clean_headline_text(supporting_news.get("title", ""))
+        finviz_bundle["supporting_headline_source"] = safe_text(supporting_news.get("source", ""))
+        finviz_bundle["supporting_headline_url"] = safe_text(supporting_news.get("url", ""))
+        finviz_bundle["supporting_headline_time"] = safe_text(supporting_news.get("time", ""))
+    else:
+        finviz_bundle["supporting_news"] = None
+        finviz_bundle["supporting_headline_title"] = ""
+        finviz_bundle["supporting_headline_source"] = ""
+        finviz_bundle["supporting_headline_url"] = ""
+        finviz_bundle["supporting_headline_time"] = ""
+
+    finviz_bundle["event_context_news"] = event_context_news
+    finviz_bundle["event_context_titles"] = [clean_headline_text(item.get("title", "")) for item in event_context_news]
+
+    float_shares = parse_metric_number(record.get("float_shares_outstanding_current"))
+    if float_shares is None:
+        float_shares = parse_metric_number(finviz_bundle.get("fallback_float_raw"))
+
+    short_pct = parse_metric_number(finviz_bundle.get("short_float_raw"))
+    display_price = finite_float(record.get("display_price"), default=finite_float(record.get("close"), default=0.0))
+
+    row = {
+        "ticker": ticker,
+        "company_name": company_name,
+        "premarket_percent": round(finite_float(record.get("premarket_change"), default=0.0), 2),
+        "premarket_gap": round(
+            finite_float(record.get("premarket_gap"), default=finite_float(record.get("premarket_change"), default=0.0)),
+            2,
+        ),
+        "premarket_volume": finite_int(record.get("premarket_volume"), default=0),
+        "price": round(display_price, 4),
+        "price_display": f"${display_price:.2f}",
+        "float_shares": float_shares,
+        "float_display": compact_number(float_shares),
+        "short_percent": short_pct,
+        "short_display": format_percent(short_pct, 1, always_sign=False) if short_pct is not None else "-",
+        "sector": finviz_bundle.get("sector") or "-",
+        "industry": finviz_bundle.get("industry") or "-",
+        "market_cap": finviz_bundle.get("market_cap_raw") or "-",
+        "news_items": finviz_bundle.get("news_items", []),
+        "primary_headline_title": finviz_bundle.get("primary_headline_title", ""),
+        "primary_headline_source": finviz_bundle.get("primary_headline_source", ""),
+        "primary_headline_url": finviz_bundle.get("primary_headline_url", ""),
+        "primary_headline_time": finviz_bundle.get("primary_headline_time", ""),
+        "primary_relevance": finviz_bundle.get("primary_relevance", "none"),
+        "primary_category": finviz_bundle.get("primary_category", "No Fresh News"),
+        "supporting_headline_title": finviz_bundle.get("supporting_headline_title", ""),
+        "supporting_headline_source": finviz_bundle.get("supporting_headline_source", ""),
+        "supporting_headline_url": finviz_bundle.get("supporting_headline_url", ""),
+        "supporting_headline_time": finviz_bundle.get("supporting_headline_time", ""),
+        "event_context_titles": finviz_bundle.get("event_context_titles", []),
+    }
+
+    ai_payload = analyze_with_ai(row, finviz_bundle)
+    row.update(ai_payload)
+    row["chart_url"] = make_multichart_url([ticker], timeframe="D")
+    return row
+
+
+def build_watchlist_row_payload(record: dict[str, Any]) -> dict[str, Any]:
+    ticker_full = safe_text(record.get("ticker"))
+    ticker = clean_symbol(ticker_full.split(":")[-1] if ":" in ticker_full else ticker_full)
+    finviz_bundle = fetch_finviz_bundle(ticker)
+    company_name = safe_text(finviz_bundle.get("company")) or safe_text(record.get("company_name") or record.get("name"))
+    primary_news = select_primary_news(
+        ticker,
+        company_name,
+        finviz_bundle.get("news_items", []),
+    )
+    supporting_news = select_supporting_news(
+        ticker,
+        company_name,
+        finviz_bundle.get("news_items", []),
+    )
+    event_context_news = select_event_context_news(finviz_bundle.get("news_items", []))
+
+    if primary_news:
+        remaining_news = [item for item in finviz_bundle.get("news_items", []) if item is not primary_news]
+        finviz_bundle["news_items"] = [primary_news] + remaining_news
+        finviz_bundle["primary_news"] = primary_news
+        finviz_bundle["primary_headline_title"] = clean_headline_text(primary_news.get("title", ""))
+        finviz_bundle["primary_headline_source"] = safe_text(primary_news.get("source", ""))
+        finviz_bundle["primary_headline_url"] = safe_text(primary_news.get("url", ""))
+        finviz_bundle["primary_headline_time"] = safe_text(primary_news.get("time", ""))
+        finviz_bundle["primary_relevance"] = infer_headline_relevance(ticker, company_name, [primary_news])
+        finviz_bundle["primary_category"] = headline_category_guess(primary_news.get("title", ""))
+    else:
+        finviz_bundle["primary_news"] = None
+        finviz_bundle["primary_headline_title"] = ""
+        finviz_bundle["primary_headline_source"] = ""
+        finviz_bundle["primary_headline_url"] = ""
+        finviz_bundle["primary_headline_time"] = ""
+        finviz_bundle["primary_relevance"] = "none"
+        finviz_bundle["primary_category"] = "No Fresh News"
+
+    if supporting_news:
+        finviz_bundle["supporting_news"] = supporting_news
+        finviz_bundle["supporting_headline_title"] = clean_headline_text(supporting_news.get("title", ""))
+        finviz_bundle["supporting_headline_source"] = safe_text(supporting_news.get("source", ""))
+        finviz_bundle["supporting_headline_url"] = safe_text(supporting_news.get("url", ""))
+        finviz_bundle["supporting_headline_time"] = safe_text(supporting_news.get("time", ""))
+    else:
+        finviz_bundle["supporting_news"] = None
+        finviz_bundle["supporting_headline_title"] = ""
+        finviz_bundle["supporting_headline_source"] = ""
+        finviz_bundle["supporting_headline_url"] = ""
+        finviz_bundle["supporting_headline_time"] = ""
+
+    finviz_bundle["event_context_news"] = event_context_news
+    finviz_bundle["event_context_titles"] = [clean_headline_text(item.get("title", "")) for item in event_context_news]
+
+    float_shares = parse_metric_number(record.get("float_shares_outstanding_current"))
+    if float_shares is None:
+        float_shares = parse_metric_number(finviz_bundle.get("fallback_float_raw"))
+
+    short_pct = parse_metric_number(finviz_bundle.get("short_float_raw"))
+    move = choose_watchlist_move(record)
+    display_price = finite_float(record.get("display_price"), default=finite_float(record.get("close"), default=0.0))
+
+    row = {
+        "ticker": ticker,
+        "company_name": company_name,
+        "analysis_mode": "watchlist",
+        "move_label": move["label"],
+        "move_percent": round(finite_float(move["percent"], default=0.0), 2),
+        "move_volume": finite_int(move["volume"], default=0),
+        "move_session": move["session"],
+        "day_change_percent": round(finite_float(record.get("change"), default=0.0), 2),
+        "regular_volume": finite_int(record.get("volume"), default=0),
+        "raw_premarket_percent": round(finite_float(record.get("premarket_change"), default=0.0), 2),
+        "raw_premarket_volume": finite_int(record.get("premarket_volume"), default=0),
+        "premarket_percent": round(finite_float(move["percent"], default=0.0), 2),
+        "premarket_gap": round(finite_float(move["percent"], default=0.0), 2),
+        "premarket_volume": finite_int(move["volume"], default=0),
+        "price": round(display_price, 4),
+        "price_display": f"${display_price:.2f}",
+        "float_shares": float_shares,
+        "float_display": compact_number(float_shares),
+        "short_percent": short_pct,
+        "short_display": format_percent(short_pct, 1, always_sign=False) if short_pct is not None else "-",
+        "sector": finviz_bundle.get("sector") or "-",
+        "industry": finviz_bundle.get("industry") or "-",
+        "market_cap": finviz_bundle.get("market_cap_raw") or safe_text(record.get("market_cap_basic")) or "-",
+        "news_items": finviz_bundle.get("news_items", []),
+        "primary_headline_title": finviz_bundle.get("primary_headline_title", ""),
+        "primary_headline_source": finviz_bundle.get("primary_headline_source", ""),
+        "primary_headline_url": finviz_bundle.get("primary_headline_url", ""),
+        "primary_headline_time": finviz_bundle.get("primary_headline_time", ""),
+        "primary_relevance": finviz_bundle.get("primary_relevance", "none"),
+        "primary_category": finviz_bundle.get("primary_category", "No Fresh News"),
+        "supporting_headline_title": finviz_bundle.get("supporting_headline_title", ""),
+        "supporting_headline_source": finviz_bundle.get("supporting_headline_source", ""),
+        "supporting_headline_url": finviz_bundle.get("supporting_headline_url", ""),
+        "supporting_headline_time": finviz_bundle.get("supporting_headline_time", ""),
+        "event_context_titles": finviz_bundle.get("event_context_titles", []),
+    }
+
+    ai_payload = analyze_with_ai(row, finviz_bundle)
+    row.update(ai_payload)
+    row["chart_url"] = make_multichart_url([ticker], timeframe="D")
+    return row
+
+
+@dataclass
+class BoardScanState:
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    market_brief: dict[str, Any] = field(default_factory=dict)
+    scan_in_progress: bool = False
+    scan_started_at: datetime | None = None
+    scan_completed_at: datetime | None = None
+    scan_duration_seconds: float | None = None
+    last_error: str = ""
+    status_text: str = "Idle"
+    progress_total: int = 0
+    progress_done: int = 0
+    latest_scan_id: int = 0
+    last_scan_origin: str = ""
+    last_exported_at: datetime | None = None
+    last_exported_path: str = ""
+    last_export_error: str = ""
+    last_scheduled_slot: str = ""
+
+    def snapshot(self, board: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            symbols = [row["ticker"] for row in self.rows]
+            grade_counts = {grade: 0 for grade in ["A", "B", "C", "D"]}
+            ai_sources = {"gemini": 0, "openrouter": 0, "openai": 0, "anthropic": 0, "fallback": 0}
+            up_count = 0
+            down_count = 0
+            total_move = 0.0
+
+            for row in self.rows:
+                grade = safe_text(row.get("grade")).upper()
+                if grade in grade_counts:
+                    grade_counts[grade] += 1
+                source = safe_text(row.get("ai_source")) or "fallback"
+                if source in ai_sources:
+                    ai_sources[source] += 1
+
+                move_pct = row_move_percent(row)
+                total_move += move_pct
+                if move_pct >= 0:
+                    up_count += 1
+                else:
+                    down_count += 1
+
+            average_move = round(total_move / len(self.rows), 2) if self.rows else 0.0
+            top_mover = "-"
+            if self.rows:
+                top_mover = max(self.rows, key=lambda item: abs(row_move_percent(item))).get("ticker", "-")
+            next_scheduled = next_scheduled_run_local()
+            if board.get("kind") == "market-brief":
+                brief_sources = []
+                if isinstance(self.market_brief.get("macro_summary"), dict):
+                    brief_sources.append(self.market_brief["macro_summary"].get("ai_source"))
+                if isinstance(self.market_brief.get("premarket_summary"), dict):
+                    brief_sources.append(self.market_brief["premarket_summary"].get("ai_source"))
+                brief_sources.extend(section.get("ai_source") for section in self.market_brief.get("sector_sections", []))
+                for source in brief_sources:
+                    if source in ai_sources:
+                        ai_sources[source] += 1
+
+            summary_payload = {
+                "count": len(self.rows),
+                "a_count": grade_counts["A"],
+                "avg_gap": average_move,
+                "best_setup": self.rows[0]["ticker"] if self.rows else "-",
+                "top_mover": top_mover,
+                "up_count": up_count,
+                "down_count": down_count,
+                "provider_order": AI_PROVIDER_ORDER,
+                "gemini_rows": ai_sources["gemini"],
+                "openrouter_rows": ai_sources["openrouter"],
+                "openai_rows": ai_sources["openai"],
+                "anthropic_rows": ai_sources["anthropic"],
+                "fallback_rows": ai_sources["fallback"],
+                "global_chart_url": make_multichart_url(symbols, timeframe="D") if symbols else "",
+            }
+
+            if board.get("kind") == "market-brief":
+                section_count = len(self.market_brief.get("sector_sections", []))
+                summary_payload.update(
+                    {
+                        "count": section_count,
+                        "macro_headline_count": len(self.market_brief.get("macro_headlines", [])),
+                        "symbols_covered": int(self.market_brief.get("symbols_covered") or 0),
+                        "priority_sector": safe_text(self.market_brief.get("priority_sector")) or "-",
+                        "best_setup": safe_text(self.market_brief.get("priority_sector")) or "-",
+                        "global_chart_url": "",
+                    }
+                )
+
+            return {
+                "title": APP_TITLE,
+                "subtitle": APP_SUBTITLE,
+                "board": board,
+                "boards": get_board_definitions(),
+                "scan_in_progress": self.scan_in_progress,
+                "scan_started_at": self.scan_started_at.isoformat() if self.scan_started_at else None,
+                "scan_completed_at": self.scan_completed_at.isoformat() if self.scan_completed_at else None,
+                "scan_started_epoch": to_epoch(self.scan_started_at),
+                "scan_completed_epoch": to_epoch(self.scan_completed_at),
+                "scan_completed_local_epoch": to_local_epoch(self.scan_completed_at),
+                "scan_duration_seconds": self.scan_duration_seconds,
+                "last_error": self.last_error,
+                "status_text": self.status_text,
+                "progress_total": self.progress_total,
+                "progress_done": self.progress_done,
+                "latest_scan_id": self.latest_scan_id,
+                "last_scan_origin": self.last_scan_origin,
+                "last_exported_at": self.last_exported_at.isoformat() if self.last_exported_at else None,
+                "last_exported_epoch": to_local_epoch(self.last_exported_at),
+                "last_exported_path": self.last_exported_path,
+                "last_export_error": self.last_export_error,
+                "last_scheduled_slot": self.last_scheduled_slot,
+                "scheduled_times_label": format_schedule_times_label(),
+                "next_scheduled_local_epoch": to_epoch(next_scheduled),
+                "next_scheduled_local_label": next_scheduled.strftime("%Y-%m-%d %I:%M %p %Z") if next_scheduled else "",
+                "summary": summary_payload,
+                "rows": self.rows,
+                "market_brief": self.market_brief,
+            }
+
+
+BOARD_STATES: dict[str, BoardScanState] = {}
+
+
+def get_board_state(board_id: str) -> BoardScanState:
+    state = BOARD_STATES.get(board_id)
+    if state is None:
+        state = BoardScanState()
+        BOARD_STATES[board_id] = state
+    return state
+
+
+def empty_error_row(symbol: str, message: str, exc: Exception | None = None) -> dict[str, Any]:
+    details = message
+    if exc is not None:
+        details = f"{message}: {exc}\n\n{traceback.format_exc(limit=2)}"
+    return {
+        "ticker": clean_symbol(symbol.split(":")[-1]),
+        "company_name": clean_symbol(symbol.split(":")[-1]),
+        "analysis_mode": "watchlist",
+        "move_label": "Day move",
+        "move_percent": 0.0,
+        "move_volume": 0,
+        "day_change_percent": 0.0,
+        "regular_volume": 0,
+        "raw_premarket_percent": 0.0,
+        "raw_premarket_volume": 0,
+        "premarket_percent": 0.0,
+        "premarket_gap": 0.0,
+        "premarket_volume": 0,
+        "price": 0.0,
+        "price_display": "$0.00",
+        "float_shares": None,
+        "float_display": "-",
+        "short_percent": None,
+        "short_display": "-",
+        "sector": "-",
+        "industry": "-",
+        "market_cap": "-",
+        "news_items": [],
+        "category": "No Fresh News",
+        "grade": "D",
+        "reasoning": message,
+        "analysis_details": details,
+        "chart_url": make_multichart_url([symbol.split(":")[-1]], timeframe="D"),
+    }
+
+
+def sort_rows_for_board(board: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    if board["kind"] == "watchlist":
+        rows.sort(
+            key=lambda item: (
+                -abs(row_move_percent(item)),
+                GRADE_ORDER.get(item.get("grade", "D"), 9),
+                -row_move_volume(item),
+            )
         )
         return
 
-    if "llm_last_error" in st.session_state and st.session_state["llm_last_error"]:
-        st.warning(f"⚠️ AI analysis error (last ticker): {st.session_state['llm_last_error']}")
-
-    auto_added = sync_auto_watchlist(enriched)
-    watchlist_items = load_watchlist()
-    filtered = apply_filters(
-        enriched,
-        min_float_shares=controls["min_float_shares"],
-        volume_breaker_only=controls["volume_breaker_only"],
+    rows.sort(
+        key=lambda item: (
+            GRADE_ORDER.get(item.get("grade", "D"), 9),
+            -float(item.get("premarket_percent") or 0.0),
+            -int(item.get("premarket_volume") or 0),
+        )
     )
 
-    # Guard: no matching stocks (scan returned empty, outside market hours, or
-    # all enrichments failed).  Show a friendly notice instead of a KeyError.
-    if filtered.empty or "is_volume_breaker" not in filtered.columns:
-        render_metrics(
-            scan_count=0,
-            breaker_count=0,
-            watchlist_count=len(watchlist_items),
-            session_label=session_label,
+
+def publish_partial_rows(
+    board: dict[str, Any],
+    state: BoardScanState,
+    scan_id: int,
+    rows: list[dict[str, Any]],
+) -> None:
+    """Keep the table populated while a slow AI batch is still in flight."""
+    published_rows = [dict(row) for row in rows]
+    apply_sector_rerating_context(published_rows)
+    sort_rows_for_board(board, published_rows)
+    with state.lock:
+        if state.latest_scan_id != scan_id:
+            return
+        state.rows = published_rows
+
+
+def build_board_rows(board: dict[str, Any], state: BoardScanState) -> list[dict[str, Any]]:
+    if board["kind"] == "premarket":
+        frame = scan_premarket_gappers()
+        if frame.empty:
+            return []
+        records = frame.to_dict(orient="records")
+        builder = build_row_payload
+        status_template = "Analyzing premarket catalysts {done}/{total}..."
+        symbol_accessor = lambda record: record["ticker"]
+    elif board["kind"] == "market-brief":
+        with state.lock:
+            state.progress_total = 0
+            state.progress_done = 0
+        brief_payload = build_market_brief_payload()
+        with state.lock:
+            state.market_brief = brief_payload
+        return []
+    else:
+        frame = scan_watchlist_symbols(board.get("symbols", []))
+        if frame.empty:
+            return []
+        records = frame.to_dict(orient="records")
+        builder = build_watchlist_row_payload
+        status_template = f"Explaining {board['title']} moves " + "{done}/{total}..."
+        symbol_accessor = lambda record: record["ticker"]
+
+    with state.lock:
+        state.progress_total = len(records)
+
+    enriched_rows: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        future_map = {pool.submit(builder, record): symbol_accessor(record) for record in records}
+        for future in as_completed(future_map):
+            symbol = future_map[future]
+            try:
+                enriched_rows.append(future.result())
+            except Exception as exc:
+                enriched_rows.append(
+                    empty_error_row(
+                        symbol,
+                        f"{clean_symbol(symbol.split(':')[-1])} failed to enrich cleanly, so this row is a placeholder until the next refresh.",
+                        exc,
+                    )
+                )
+
+            with state.lock:
+                state.progress_done += 1
+                state.status_text = status_template.format(done=state.progress_done, total=state.progress_total)
+            publish_partial_rows(board, state, state.latest_scan_id, enriched_rows)
+
+    apply_sector_rerating_context(enriched_rows)
+    sort_rows_for_board(board, enriched_rows)
+    return enriched_rows
+
+
+def ensure_rows_for_market_brief(board: dict[str, Any]) -> list[dict[str, Any]]:
+    state = get_board_state(board["id"])
+    with state.lock:
+        existing_rows = [dict(row) for row in state.rows]
+        completed_at = state.scan_completed_at
+    if existing_rows and completed_at and (utc_now() - completed_at).total_seconds() <= max(ANALYSIS_CACHE_TTL_SECONDS, 1800):
+        return existing_rows
+
+    rows = build_board_rows(board, state)
+    with state.lock:
+        state.rows = rows
+        state.scan_completed_at = utc_now()
+        state.status_text = f"Loaded {board['title']} for market brief context."
+    return rows
+
+
+def collect_macro_headlines() -> list[dict[str, str]]:
+    merged: list[dict[str, str]] = []
+    for symbol in MARKET_BRIEF_MACRO_SYMBOLS:
+        merged.extend(fetch_yfinance_news_items(symbol))
+    merged.sort(key=lambda item: safe_text(item.get("published_at")), reverse=True)
+    return dedupe_headline_items(merged, limit=10)
+
+
+def build_market_brief_payload() -> dict[str, Any]:
+    watchlist_boards = [board for board in get_board_definitions() if board.get("kind") == "watchlist"]
+    sector_sections: list[dict[str, Any]] = []
+    symbols_covered = 0
+
+    macro_headlines = collect_macro_headlines()
+    premarket_rows = ensure_rows_for_market_brief(get_board_definition("premarket"))
+    premarket_headlines = collect_top_headlines_from_rows(premarket_rows, limit=6)
+    macro_context = f"Watchlist sectors being tracked: {', '.join(board.get('title', '') for board in watchlist_boards)}"
+    macro_summary = analyze_market_brief_section("macro", "US Market Impact Brief", macro_headlines, premarket_rows[:5], extra_context=macro_context)
+    premarket_summary = analyze_market_brief_section(
+        "premarket",
+        "Premarket Setup",
+        premarket_headlines,
+        premarket_rows[:5],
+        extra_context="Focus on whether leadership is catalyst-driven, macro-driven, or mostly tape and squeeze pressure before the cash open.",
+    )
+
+    for watchlist_board in watchlist_boards:
+        rows = ensure_rows_for_market_brief(watchlist_board)
+        symbols_covered += len(rows)
+        movers = sorted(rows, key=lambda item: abs(row_move_percent(item)), reverse=True)
+        top_movers = format_brief_movers(movers, limit=4)
+        headlines = collect_top_headlines_from_rows(rows, limit=6)
+        mover_tickers = ", ".join(item["ticker"] for item in top_movers) if top_movers else "-"
+        section_ai = analyze_market_brief_section(
+            "sector",
+            watchlist_board["title"],
+            headlines,
+            movers[:5],
+            extra_context=f"Sector watchlist: {watchlist_board['title']}. Top movers: {mover_tickers}.",
         )
-        st.info(
-            "No premarket gappers matched the current scan settings.\n\n"
-            "This is normal outside US premarket hours (4:00 – 9:30 AM ET). "
-            "Try lowering the **Min % gap** or **Min premarket volume** filters, "
-            "or wait until US premarket opens."
+        sector_sections.append(
+            {
+                "title": watchlist_board["title"],
+                "symbol_count": watchlist_board.get("symbol_count", len(watchlist_board.get("symbols", []))),
+                "top_movers": top_movers,
+                "headlines": headlines,
+                "summary": section_ai["summary"],
+                "analysis_details": section_ai["analysis_details"],
+                "importance": section_ai["importance"],
+                "ai_source": section_ai["ai_source"],
+            }
         )
+
+    sector_sections.sort(
+        key=lambda section: (
+            {"High": 0, "Medium": 1, "Low": 2}.get(section.get("importance", "Low"), 3),
+            -max((abs(item.get("move_percent", 0.0)) for item in section.get("top_movers", [])), default=0.0),
+            section.get("title", ""),
+        )
+    )
+
+    return {
+        "generated_at": local_now().isoformat(),
+        "macro_headlines": macro_headlines,
+        "macro_summary": macro_summary,
+        "premarket_summary": {
+            **premarket_summary,
+            "top_movers": format_brief_movers(premarket_rows, limit=5),
+            "headlines": premarket_headlines,
+        },
+        "sector_sections": sector_sections,
+        "priority_sector": sector_sections[0]["title"] if sector_sections else "-",
+        "symbols_covered": symbols_covered,
+    }
+
+
+def run_scan_job(board_id: str, scan_id: int, origin: str = "manual") -> None:
+    board = get_board_definition(board_id)
+    state = get_board_state(board_id)
+    started_at = utc_now()
+    with state.lock:
+        state.scan_started_at = started_at
+        state.last_scan_origin = origin
+        state.status_text = (
+            "Running TradingView premarket scan..."
+            if board["kind"] == "premarket"
+            else ("Building market brief..." if board["kind"] == "market-brief" else f"Loading {board['title']} watchlist...")
+        )
+        state.progress_total = 0
+        state.progress_done = 0
+        state.last_error = ""
+        state.last_export_error = ""
+        if board["kind"] == "market-brief":
+            state.market_brief = {}
+
+    try:
+        enriched_rows = build_board_rows(board, state)
+    except Exception as exc:
+        with state.lock:
+            if state.latest_scan_id != scan_id:
+                return
+            state.last_error = str(exc)
+            state.status_text = "Scan failed."
+            state.scan_completed_at = utc_now()
+            state.scan_duration_seconds = round((state.scan_completed_at - started_at).total_seconds(), 2)
+    else:
+        with state.lock:
+            if state.latest_scan_id != scan_id:
+                return
+            state.rows = enriched_rows
+            state.scan_completed_at = utc_now()
+            state.scan_duration_seconds = round((state.scan_completed_at - started_at).total_seconds(), 2)
+            if board["kind"] == "market-brief":
+                state.status_text = "Market brief updated."
+            elif enriched_rows:
+                state.status_text = f"Scan complete: {len(enriched_rows)} names ranked."
+            else:
+                state.status_text = "Scan complete. No symbols matched the current filters."
+            state.last_error = ""
+
+        if should_export_to_obsidian(board, origin):
+            try:
+                snapshot = state.snapshot(board)
+                note_path = export_snapshot_to_obsidian(board, snapshot)
+            except Exception as exc:
+                with state.lock:
+                    if state.latest_scan_id == scan_id:
+                        state.last_export_error = str(exc)
+                        state.status_text = "Scan complete, but Obsidian export failed."
+            else:
+                with state.lock:
+                    if state.latest_scan_id == scan_id:
+                        state.last_exported_at = utc_now()
+                        state.last_exported_path = str(note_path)
+                        state.last_export_error = ""
+                        state.status_text = (
+                            "Market brief updated. Synced to Obsidian."
+                            if board["kind"] == "market-brief"
+                            else (
+                                f"Scan complete: {len(enriched_rows)} names ranked. Synced to Obsidian."
+                                if enriched_rows
+                                else "Scan complete. Synced to Obsidian."
+                            )
+                        )
+    finally:
+        with state.lock:
+            if state.latest_scan_id == scan_id:
+                state.scan_in_progress = False
+
+
+def board_snapshot(board_id: str) -> dict[str, Any]:
+    board = get_board_definition(board_id)
+    state = get_board_state(board_id)
+    return sanitize_json_compatible(state.snapshot(board))
+
+
+def default_board_id() -> str:
+    boards = get_board_definitions()
+    for board in boards:
+        if board["kind"] == "watchlist":
+            return board["id"]
+    return boards[0]["id"]
+
+
+def start_scan(board_id: str, force: bool = False, origin: str = "manual") -> dict[str, Any]:
+    board = get_board_definition(board_id)
+    state = get_board_state(board["id"])
+    with state.lock:
+        if state.scan_in_progress:
+            return sanitize_json_compatible(state.snapshot(board))
+
+        state.scan_in_progress = True
+        state.latest_scan_id += 1
+        current_scan_id = state.latest_scan_id
+        state.last_scan_origin = origin
+        state.status_text = "Starting scan..."
+
+    worker = threading.Thread(target=run_scan_job, args=(board["id"], current_scan_id, origin), daemon=True)
+    worker.start()
+    return sanitize_json_compatible(state.snapshot(board))
+
+
+BACKGROUND_SERVICES_LOCK = threading.Lock()
+BACKGROUND_SERVICES_STARTED = False
+
+
+def scheduled_scan_boards() -> list[dict[str, Any]]:
+    boards = [board for board in get_board_definitions() if board.get("kind", "").lower() in SCHEDULED_SCAN_BOARD_KINDS]
+    priority = {"premarket": 0, "watchlist": 1, "market-brief": 2}
+    return sorted(boards, key=lambda board: (priority.get(board.get("kind", ""), 9), board.get("title", "")))
+
+
+def wait_for_scan_completion(board_id: str, timeout_seconds: int = 3600) -> None:
+    deadline = time.time() + timeout_seconds
+    state = get_board_state(board_id)
+    while time.time() < deadline:
+        with state.lock:
+            if not state.scan_in_progress:
+                return
+        time.sleep(2)
+
+
+def run_scheduled_scan_cycle(slot_key: str) -> None:
+    for board in scheduled_scan_boards():
+        state = get_board_state(board["id"])
+        with state.lock:
+            if state.last_scheduled_slot == slot_key:
+                continue
+            state.last_scheduled_slot = slot_key
+        start_scan(board["id"], force=True, origin="scheduled")
+        wait_for_scan_completion(board["id"])
+        if SCHEDULED_SCAN_STAGGER_SECONDS > 0:
+            time.sleep(SCHEDULED_SCAN_STAGGER_SECONDS)
+
+
+def scheduled_scan_loop() -> None:
+    while True:
+        try:
+            slot_key = current_schedule_slot_key()
+            if slot_key:
+                run_scheduled_scan_cycle(slot_key)
+        except Exception:
+            traceback.print_exc()
+        time.sleep(20)
+
+
+def should_start_background_services() -> bool:
+    if not SCHEDULED_SCAN_ENABLED:
+        return False
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        return True
+    if os.getenv("FLASK_DEBUG", "").lower() in {"1", "true", "yes", "on"}:
+        return False
+    return True
+
+
+app = Flask(__name__)
+
+
+def start_background_services() -> None:
+    global BACKGROUND_SERVICES_STARTED
+    if not should_start_background_services():
         return
+    with BACKGROUND_SERVICES_LOCK:
+        if BACKGROUND_SERVICES_STARTED:
+            return
+        worker = threading.Thread(target=scheduled_scan_loop, daemon=True, name="scheduled-scan-loop")
+        worker.start()
+        BACKGROUND_SERVICES_STARTED = True
 
-    volume_breakers = filtered[filtered["is_volume_breaker"]].reset_index(drop=True)
 
-    render_metrics(
-        scan_count=len(filtered),
-        breaker_count=len(volume_breakers),
-        watchlist_count=len(watchlist_items),
-        session_label=session_label,
+start_background_services()
+
+
+@app.get("/")
+def index() -> str:
+    boards = get_board_definitions()
+    return render_template_string(
+        HTML_TEMPLATE,
+        app_title=APP_TITLE,
+        app_subtitle=APP_SUBTITLE,
+        auto_refresh_seconds=AUTO_REFRESH_SECONDS,
+        min_premarket_pct=MIN_PREMARKET_PCT,
+        min_premarket_volume=MIN_PREMARKET_VOLUME,
+        ai_provider_order=" -> ".join(provider_display_name(provider) for provider in AI_PROVIDER_ORDER),
+        boards=boards,
+        default_board_id=default_board_id(),
+        app_timezone=APP_TIMEZONE,
     )
 
-    if auto_added:
-        st.success(f"Auto-added {auto_added} new volume breaker(s) to watchlist.json.")
 
-    tabs = st.tabs(["Premarket Gappers", "Highest Volume Ever Today"])
-    with tabs[0]:
-        st.caption(
-            "Rows are filtered to US-listed common stocks with premarket gap magnitude, premarket volume, "
-            "and price requirements. Grade is derived from EMA10 / EMA20 / SMA50 trend structure."
-        )
-        render_scan_table(filtered, table_key="main")
+@app.post("/api/scan")
+def trigger_scan() -> Any:
+    board_id = request.args.get("board_id", default_board_id())
+    force = request.args.get("force", "0").lower() in {"1", "true", "yes"}
+    origin = request.args.get("origin", "manual").strip().lower() or "manual"
+    payload = start_scan(board_id=board_id, force=force, origin=origin)
+    return jsonify(payload)
 
-    with tabs[1]:
-        st.caption(
-            "These names are already within 20% of their all-time daily volume high based on yfinance history. "
-            "They are also auto-added to the watchlist."
-        )
-        render_scan_table(volume_breakers, table_key="breaker")
+
+@app.get("/api/status")
+def scan_status() -> Any:
+    board_id = request.args.get("board_id", default_board_id())
+    return jsonify(board_snapshot(board_id))
+
+
+HTML_TEMPLATE = (
+    r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_title }}</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap');
+
+    :root {
+      --bg: #0b1621;
+      --panel: rgba(18, 30, 44, 0.94);
+      --panel-2: rgba(26, 40, 56, 0.94);
+      --line: rgba(138, 161, 185, 0.2);
+      --line-2: rgba(138, 161, 185, 0.12);
+      --text: #edf4ff;
+      --muted: #9eb4c9;
+      --green: #36d399;
+      --red: #ff7b7b;
+      --amber: #ffbe69;
+      --blue: #6fb7ff;
+      --shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      background:
+        radial-gradient(circle at top right, rgba(54, 211, 153, 0.12), transparent 24%),
+        radial-gradient(circle at left top, rgba(111, 183, 255, 0.18), transparent 32%),
+        linear-gradient(180deg, #132230 0%, #0b1520 100%);
+      color: var(--text);
+      font-family: "IBM Plex Sans", sans-serif;
+      padding: 28px;
+    }
+
+    a { color: inherit; text-decoration: none; }
+    .shell { max-width: 1440px; margin: 0 auto; }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: start;
+      margin-bottom: 18px;
+    }
+
+    .hero-card, .summary-card, .status-card, .table-card, .tabs-card {
+      background: linear-gradient(180deg, rgba(19, 31, 46, 0.97), rgba(13, 22, 33, 0.95));
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+      border-radius: 24px;
+    }
+
+    .hero-card {
+      padding: 24px 26px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero-card::after {
+      content: "";
+      position: absolute;
+      inset: auto -40px -60px auto;
+      width: 220px;
+      height: 220px;
+      background: radial-gradient(circle, rgba(111, 183, 255, 0.16), transparent 68%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      color: var(--blue);
+      font-size: 12px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      font-weight: 700;
+      margin-bottom: 12px;
+    }
+
+    .title {
+      margin: 0 0 10px;
+      font-family: "Space Grotesk", sans-serif;
+      font-size: clamp(32px, 4vw, 44px);
+      line-height: 0.96;
+      letter-spacing: -0.04em;
+    }
+
+    .subtitle {
+      margin: 0;
+      max-width: 740px;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.6;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: flex-end;
+      align-content: start;
+    }
+
+    .button, .button-link {
+      border: 1px solid var(--line);
+      background: rgba(20, 31, 44, 0.9);
+      color: var(--text);
+      border-radius: 14px;
+      padding: 12px 16px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+    }
+
+    .button:hover, .button-link:hover { transform: translateY(-1px); border-color: rgba(111, 183, 255, 0.45); }
+    .button-primary { background: linear-gradient(180deg, rgba(24, 112, 255, 0.78), rgba(17, 75, 168, 0.9)); }
+    .button-success { background: linear-gradient(180deg, rgba(36, 158, 114, 0.85), rgba(26, 112, 82, 0.9)); }
+
+    .button[disabled], .button-link.disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      pointer-events: none;
+      transform: none;
+    }
+
+    .tabs-card {
+      padding: 14px;
+      margin-bottom: 18px;
+    }
+
+    .board-tabs {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 10px;
+    }
+
+    .board-tab {
+      min-width: 0;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(20, 32, 46, 0.9);
+      color: var(--text);
+      padding: 13px 14px;
+      cursor: pointer;
+      text-align: left;
+      transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+    }
+
+    .board-tab:hover {
+      transform: translateY(-1px);
+      border-color: rgba(111, 183, 255, 0.38);
+    }
+
+    .board-tab.active {
+      background: linear-gradient(180deg, rgba(39, 126, 255, 0.26), rgba(24, 88, 188, 0.26));
+      border-color: rgba(111, 183, 255, 0.52);
+    }
+
+    .board-tab-name {
+      font-size: 14px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .board-tab-meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    .summary-card {
+      padding: 18px 20px;
+      min-height: 126px;
+    }
+
+    .summary-label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      margin-bottom: 12px;
+      font-weight: 700;
+    }
+
+    .summary-value {
+      font-size: clamp(28px, 3vw, 38px);
+      line-height: 1;
+      font-family: "Space Grotesk", sans-serif;
+      letter-spacing: -0.04em;
+      margin-bottom: 10px;
+    }
+
+    .summary-note {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .status-card {
+      padding: 18px 20px;
+      margin-bottom: 18px;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .status-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      background: var(--blue);
+      box-shadow: 0 0 0 7px rgba(111, 183, 255, 0.12);
+    }
+
+    .status-dot.scanning {
+      background: var(--amber);
+      box-shadow: 0 0 0 7px rgba(255, 190, 105, 0.14);
+      animation: pulse 1.4s infinite;
+    }
+
+    .status-dot.error {
+      background: var(--red);
+      box-shadow: 0 0 0 7px rgba(255, 123, 123, 0.14);
+    }
+
+    @keyframes pulse {
+      0% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.14); opacity: 0.75; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+
+    .status-title {
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .status-meta {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .status-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+
+    .chip {
+      border-radius: 999px;
+      padding: 9px 12px;
+      background: rgba(21, 33, 48, 0.95);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .table-card { overflow: hidden; }
+
+    .table-top {
+      padding: 18px 22px 14px;
+      border-bottom: 1px solid var(--line-2);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .table-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin: 0 0 4px;
+    }
+
+    .table-note {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    table { width: 100%; border-collapse: collapse; }
+
+    thead th {
+      padding: 14px 22px;
+      border-bottom: 1px solid var(--line);
+      color: #cfe0f2;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      font-weight: 700;
+      text-align: left;
+      background: rgba(18, 30, 43, 0.97);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+
+    tbody tr.main-row {
+      cursor: pointer;
+      transition: background 0.18s ease;
+    }
+
+    tbody tr.main-row:hover { background: rgba(30, 45, 61, 0.72); }
+
+    tbody td {
+      padding: 16px 22px;
+      border-bottom: 1px solid var(--line-2);
+      vertical-align: top;
+      font-size: 14px;
+    }
+
+    .ticker-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .ticker-main {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+    }
+
+    .ticker-sub {
+      color: var(--muted);
+      font-size: 12px;
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .positive { color: var(--green); font-weight: 700; }
+    .negative { color: var(--red); font-weight: 700; }
+    .muted { color: var(--muted); }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      padding: 8px 12px;
+      border: 1px solid transparent;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .pill::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: currentColor;
+      opacity: 0.88;
+    }
+
+    .grade-a { color: #84ffd0; background: rgba(54, 211, 153, 0.14); border-color: rgba(54, 211, 153, 0.34); }
+    .grade-b { color: #85c4ff; background: rgba(111, 183, 255, 0.14); border-color: rgba(111, 183, 255, 0.32); }
+    .grade-c { color: #ffd18b; background: rgba(255, 190, 105, 0.14); border-color: rgba(255, 190, 105, 0.3); }
+    .grade-d { color: #ffacac; background: rgba(255, 123, 123, 0.14); border-color: rgba(255, 123, 123, 0.3); }
+
+    .cat-earnings,
+    .cat-analyst-upgrade { color: #7cc7ff; background: rgba(111, 183, 255, 0.14); border-color: rgba(111, 183, 255, 0.3); }
+    .cat-fda-clinical,
+    .cat-pr-contract,
+    .cat-ma-rumor { color: #8ff0c8; background: rgba(54, 211, 153, 0.14); border-color: rgba(54, 211, 153, 0.32); }
+    .cat-financing-offering { color: #ffb8b8; background: rgba(255, 123, 123, 0.14); border-color: rgba(255, 123, 123, 0.28); }
+    .cat-sympathy-sector,
+    .cat-low-float-momentum,
+    .cat-no-fresh-news { color: #ffd18b; background: rgba(255, 190, 105, 0.14); border-color: rgba(255, 190, 105, 0.28); }
+
+    .reasoning {
+      color: #e7eef7;
+      line-height: 1.5;
+      max-width: 440px;
+    }
+
+    .action-cell {
+      white-space: nowrap;
+      text-align: right;
+    }
+
+    .market-brief-shell {
+      display: grid;
+      gap: 18px;
+      padding: 20px 22px 24px;
+    }
+
+    .market-brief-hero,
+    .market-brief-card {
+      border: 1px solid var(--line);
+      background: rgba(17, 28, 40, 0.78);
+      border-radius: 18px;
+      padding: 18px;
+    }
+
+    .market-brief-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .market-brief-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+
+    .market-brief-summary {
+      color: #edf4ff;
+      font-size: 15px;
+      line-height: 1.65;
+      margin-bottom: 12px;
+    }
+
+    .market-brief-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .market-brief-pill {
+      border-radius: 999px;
+      padding: 7px 11px;
+      font-size: 12px;
+      font-weight: 700;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      background: rgba(12, 20, 30, 0.84);
+    }
+
+    .market-brief-headlines,
+    .market-brief-movers {
+      display: grid;
+      gap: 10px;
+    }
+
+    .market-brief-item {
+      border: 1px solid var(--line-2);
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: rgba(11, 18, 28, 0.72);
+    }
+
+    .market-brief-item-title {
+      font-weight: 700;
+      line-height: 1.5;
+      margin-bottom: 5px;
+    }
+
+    .market-brief-item-meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+"""
+    r"""
+    .row-button {
+      border-radius: 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      background: rgba(26, 41, 58, 0.92);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+    }
+
+    .detail-row {
+      display: none;
+      background:
+        linear-gradient(180deg, rgba(16, 27, 39, 0.98), rgba(11, 19, 29, 0.96)),
+        radial-gradient(circle at top right, rgba(54, 211, 153, 0.06), transparent 20%);
+    }
+
+    .detail-row.open { display: table-row; }
+
+    .detail-shell {
+      padding: 24px 26px 26px;
+      display: grid;
+      grid-template-columns: minmax(0, 1.7fr) minmax(300px, 0.95fr);
+      gap: 22px;
+    }
+
+    .detail-block {
+      border: 1px solid var(--line);
+      background: rgba(24, 36, 51, 0.76);
+      border-radius: 18px;
+      padding: 18px 18px 16px;
+    }
+
+    .detail-heading {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.16em;
+      color: var(--muted);
+      font-weight: 700;
+      margin-bottom: 14px;
+    }
+
+    .detail-paragraph {
+      margin: 0 0 14px;
+      line-height: 1.72;
+      color: #d9e6f3;
+      font-size: 14px;
+    }
+
+    .detail-paragraph:last-child { margin-bottom: 0; }
+    .headline-list { display: grid; gap: 12px; }
+
+    .headline-item {
+      border: 1px solid var(--line-2);
+      border-radius: 14px;
+      padding: 14px;
+      background: rgba(18, 29, 42, 0.76);
+    }
+
+    .headline-meta {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+
+    .headline-title {
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+      font-weight: 600;
+    }
+
+    .headline-link {
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      display: inline-block;
+      margin-top: 10px;
+    }
+
+    .empty {
+      padding: 42px 22px 50px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .footer-note {
+      padding: 16px 22px 20px;
+      color: var(--muted);
+      font-size: 12px;
+      border-top: 1px solid var(--line-2);
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    @media (max-width: 1180px) {
+      .hero, .status-card, .detail-shell { grid-template-columns: 1fr; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .market-brief-grid { grid-template-columns: 1fr; }
+      .status-badges { justify-content: flex-start; }
+      .action-cell { text-align: left; }
+    }
+
+    @media (max-width: 780px) {
+      body { padding: 16px; }
+      .summary-grid { grid-template-columns: 1fr; }
+      table, thead, tbody, th, td, tr { display: block; }
+      thead { display: none; }
+      tbody tr.main-row {
+        padding: 14px 0;
+        border-bottom: 1px solid var(--line);
+      }
+      tbody td {
+        padding: 8px 18px;
+        border: 0;
+      }
+      .detail-row.open { display: block; }
+      .table-card { overflow: visible; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="hero-card">
+        <div class="eyebrow">Premarket Catalyst Dashboard</div>
+        <h1 class="title">{{ app_title }}</h1>
+        <p class="subtitle">
+          {{ app_subtitle }}. Your shared TradingView watchlists load as separate tabs, and each tab explains what moved each stock today with Finviz headlines plus catalyst reasoning.
+        </p>
+      </div>
+      <div class="hero-actions">
+        <button class="button button-primary" id="refreshButton" type="button">Refresh Scan</button>
+        <a class="button-link button-success disabled" id="globalChartButton" href="#" target="_blank" rel="noreferrer">Launch Multi-Chart</a>
+      </div>
+    </section>
+
+    <section class="tabs-card">
+      <div class="board-tabs" id="boardTabs"></div>
+    </section>
+
+    <section class="summary-grid">
+      <article class="summary-card">
+        <div class="summary-label" id="summaryCountLabel">Symbols</div>
+        <div class="summary-value" id="summaryCount">-</div>
+        <div class="summary-note" id="summaryCountNote">Matching names in the selected board.</div>
+      </article>
+      <article class="summary-card">
+        <div class="summary-label" id="summarySecondLabel">A Grades</div>
+        <div class="summary-value" id="summaryAGrades">-</div>
+        <div class="summary-note" id="summarySecondNote">Highest-confidence catalyst setups ranked by Gemini.</div>
+      </article>
+      <article class="summary-card">
+        <div class="summary-label" id="summaryAvgLabel">Average Move %</div>
+        <div class="summary-value" id="summaryAvgGap">-</div>
+        <div class="summary-note" id="summaryAvgNote">Average move across the selected board.</div>
+      </article>
+      <article class="summary-card">
+        <div class="summary-label" id="summaryBestLabel">Best Setup</div>
+        <div class="summary-value" id="summaryBestSetup">-</div>
+        <div class="summary-note" id="summaryBestNote">Top-ranked name after catalyst and liquidity scoring.</div>
+      </article>
+    </section>
+
+    <section class="status-card">
+      <div class="status-dot" id="statusDot"></div>
+      <div>
+        <div class="status-title" id="statusTitle">Waiting for first scan...</div>
+        <div class="status-meta" id="statusMeta">The page triggers a background scan on load so the UI stays responsive.</div>
+      </div>
+      <div class="status-badges">
+        <div class="chip">AI Order: {{ ai_provider_order }}</div>
+        <div class="chip" id="aiModeChip">AI: waiting</div>
+        <div class="chip" id="lastScanChip">Last scan: never</div>
+        <div class="chip" id="scheduleChip">Schedule: 8:30 AM & 8:30 PM {{ app_timezone }}</div>
+        <div class="chip" id="nextRefreshChip">Next refresh: {{ auto_refresh_seconds }}s</div>
+      </div>
+    </section>
+
+    <section class="table-card">
+      <div class="table-top">
+        <div>
+          <div class="table-title" id="tableTitle">Live Board</div>
+          <div class="table-note" id="tableNote">Click any row for the full 3-4 paragraph AI breakdown and the latest merged headlines.</div>
+        </div>
+      </div>
+
+      <div id="marketBriefShell" class="market-brief-shell" style="display:none;"></div>
+
+      <table id="dataTable">
+        <thead>
+          <tr>
+            <th>Ticker</th>
+            <th id="moveHeader">Move %</th>
+            <th>Volume</th>
+            <th>Float</th>
+            <th>Short %</th>
+            <th>Category</th>
+            <th>Grade</th>
+            <th>Reasoning</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="tableBody">
+          <tr><td class="empty" colspan="9">Waiting for the first scan...</td></tr>
+        </tbody>
+      </table>
+
+      <div class="footer-note">
+        <span id="footerLeft">TradingView scan uses positive premarket movers only.</span>
+        <span id="footerRight">News is merged from Yahoo Finance and the maintained lit26 Finviz fork. ib_chart opens on `tf=D` by default.</span>
+      </div>
+    </section>
+  </div>
+"""
+    r"""
+  <script>
+    const AUTO_REFRESH_SECONDS = {{ auto_refresh_seconds | tojson }};
+    const INITIAL_BOARDS = {{ boards | tojson }};
+    const DEFAULT_BOARD_ID = {{ default_board_id | tojson }};
+    let latestPayload = null;
+    let selectedBoardId = DEFAULT_BOARD_ID;
+    let refreshCountdown = AUTO_REFRESH_SECONDS;
+    const boardCache = Object.fromEntries(INITIAL_BOARDS.map((board) => [board.id, null]));
+
+    const boardTabs = document.getElementById("boardTabs");
+    const refreshButton = document.getElementById("refreshButton");
+    const globalChartButton = document.getElementById("globalChartButton");
+    const dataTable = document.getElementById("dataTable");
+    const tableBody = document.getElementById("tableBody");
+    const tableTitle = document.getElementById("tableTitle");
+    const tableNote = document.getElementById("tableNote");
+    const marketBriefShell = document.getElementById("marketBriefShell");
+    const moveHeader = document.getElementById("moveHeader");
+    const footerLeft = document.getElementById("footerLeft");
+    const footerRight = document.getElementById("footerRight");
+    const summaryCountLabel = document.getElementById("summaryCountLabel");
+    const summaryCount = document.getElementById("summaryCount");
+    const summaryCountNote = document.getElementById("summaryCountNote");
+    const summarySecondLabel = document.getElementById("summarySecondLabel");
+    const summaryAGrades = document.getElementById("summaryAGrades");
+    const summarySecondNote = document.getElementById("summarySecondNote");
+    const summaryAvgLabel = document.getElementById("summaryAvgLabel");
+    const summaryAvgGap = document.getElementById("summaryAvgGap");
+    const summaryAvgNote = document.getElementById("summaryAvgNote");
+    const summaryBestLabel = document.getElementById("summaryBestLabel");
+    const summaryBestSetup = document.getElementById("summaryBestSetup");
+    const summaryBestNote = document.getElementById("summaryBestNote");
+    const statusDot = document.getElementById("statusDot");
+    const statusTitle = document.getElementById("statusTitle");
+    const statusMeta = document.getElementById("statusMeta");
+    const aiModeChip = document.getElementById("aiModeChip");
+    const lastScanChip = document.getElementById("lastScanChip");
+    const scheduleChip = document.getElementById("scheduleChip");
+    const nextRefreshChip = document.getElementById("nextRefreshChip");
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function slugifyCategory(category) {
+      return "cat-" + String(category || "no-fresh-news")
+        .toLowerCase()
+        .replaceAll("/", " ")
+        .replaceAll("&", " ")
+        .replace(/[^\w\s-]/g, "")
+        .trim()
+        .replace(/\s+/g, "-");
+    }
+
+    function gradeClass(grade) {
+      return "grade-" + String(grade || "d").toLowerCase();
+    }
+
+    function formatPercent(value) {
+      const number = Number(value || 0);
+      const sign = number > 0 ? "+" : "";
+      return `${sign}${number.toFixed(1)}%`;
+    }
+
+    function formatVolume(value) {
+      const number = Number(value || 0);
+      if (number >= 1_000_000_000) return `${(number / 1_000_000_000).toFixed(1)}B`;
+      if (number >= 1_000_000) return `${(number / 1_000_000).toFixed(1)}M`;
+      if (number >= 1_000) return `${(number / 1_000).toFixed(1)}K`;
+      return `${Math.round(number)}`;
+    }
+
+    function boardById(boardId) {
+      return (latestPayload?.boards || INITIAL_BOARDS).find((board) => board.id === boardId) || INITIAL_BOARDS[0];
+    }
+
+    function rowMovePercent(row) {
+      return Number(row.move_percent ?? row.premarket_percent ?? 0);
+    }
+
+    function rowMoveVolume(row) {
+      return Number(row.move_volume ?? row.premarket_volume ?? 0);
+    }
+
+    function rowMoveLabel(row) {
+      return row.move_label || "Premarket move";
+    }
+
+    function relativeLastScanText(epochSeconds) {
+      if (!epochSeconds) return "Last scan: never";
+      const secondsAgo = Math.max(0, Math.floor(Date.now() / 1000 - epochSeconds));
+      return `Last scan: ${secondsAgo}s ago`;
+    }
+
+    function relativeExportText(epochSeconds) {
+      if (!epochSeconds) return "never";
+      const secondsAgo = Math.max(0, Math.floor(Date.now() / 1000 - epochSeconds));
+      return `${secondsAgo}s ago`;
+    }
+
+    function renderBoardTabs(boards) {
+      boardTabs.innerHTML = boards.map((board) => `
+        <button class="board-tab ${board.id === selectedBoardId ? "active" : ""}" type="button" data-board-id="${escapeHtml(board.id)}">
+          <div class="board-tab-name">${escapeHtml(board.title)}</div>
+          <div class="board-tab-meta">${escapeHtml(board.description || `${board.symbol_count || 0} symbols`)}</div>
+        </button>
+      `).join("");
+
+      boardTabs.querySelectorAll("[data-board-id]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const boardId = button.dataset.boardId;
+          if (!boardId || boardId === selectedBoardId) return;
+          selectedBoardId = boardId;
+          refreshCountdown = AUTO_REFRESH_SECONDS;
+          renderBoardTabs(boards);
+          ensureBoardLoaded(boardId, false, "view").catch((error) => {
+            statusTitle.textContent = "Failed to switch board";
+            statusMeta.textContent = String(error);
+          });
+        });
+      });
+    }
+
+    function renderHeadlineList(items) {
+      if (!items || !items.length) {
+        return `<div class="headline-item"><div class="headline-title muted">No recent Finviz headlines were returned for this ticker.</div></div>`;
+      }
+      return items.map((item) => {
+        const sourceBits = [item.source, item.time].filter(Boolean).join(" - ");
+        const linkHtml = item.url
+          ? `<a class="headline-link" href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">Open Headline</a>`
+          : "";
+        return `
+          <div class="headline-item">
+            <div class="headline-meta">${escapeHtml(sourceBits || "Headline")}</div>
+            <div class="headline-title">${escapeHtml(item.title || "")}</div>
+            ${linkHtml}
+          </div>
+        `;
+      }).join("");
+    }
+
+    function renderAnalysisParagraphs(text) {
+      return String(text || "")
+        .split(/\n\s*\n/)
+        .filter(Boolean)
+        .map((paragraph) => `<p class="detail-paragraph">${escapeHtml(paragraph.trim())}</p>`)
+        .join("");
+    }
+
+    function renderBriefHeadlines(items) {
+      if (!items || !items.length) {
+        return `<div class="market-brief-item"><div class="market-brief-item-title muted">No fresh headlines captured.</div></div>`;
+      }
+      return items.map((item) => `
+        <div class="market-brief-item">
+          <div class="market-brief-item-title">${escapeHtml(item.title || "")}</div>
+          <div class="market-brief-item-meta">${escapeHtml([item.source, item.time].filter(Boolean).join(" - "))}</div>
+        </div>
+      `).join("");
+    }
+
+    function renderBriefMovers(items) {
+      if (!items || !items.length) {
+        return `<div class="market-brief-item"><div class="market-brief-item-title muted">No movers captured for this section.</div></div>`;
+      }
+      return items.map((item) => `
+        <div class="market-brief-item">
+          <div class="market-brief-item-title">${escapeHtml(item.ticker || "")} ${escapeHtml(formatPercent(item.move_percent || 0))}</div>
+          <div class="market-brief-item-meta">${escapeHtml((item.category || "-") + " / " + (item.grade || "-"))}</div>
+          <div class="market-brief-item-meta">${escapeHtml(item.reasoning || "")}</div>
+        </div>
+      `).join("");
+    }
+
+    function renderMarketBrief(brief) {
+      const generatedAt = brief?.generated_at ? new Date(brief.generated_at).toLocaleString() : "";
+      const macro = brief?.macro_summary || {};
+      const premarket = brief?.premarket_summary || {};
+      const sectors = brief?.sector_sections || [];
+
+      marketBriefShell.innerHTML = `
+        <div class="market-brief-hero">
+          <div class="market-brief-title">Market Impact Brief</div>
+          <div class="market-brief-summary">${escapeHtml(macro.summary || "Waiting for macro summary...")}</div>
+          <div class="market-brief-meta">
+            <span class="market-brief-pill">Importance: ${escapeHtml(macro.importance || "-")}</span>
+            <span class="market-brief-pill">Priority Sector: ${escapeHtml(brief?.priority_sector || "-")}</span>
+            <span class="market-brief-pill">Generated: ${escapeHtml(generatedAt || "-")}</span>
+          </div>
+          ${renderAnalysisParagraphs(macro.analysis_details || "")}
+        </div>
+        <div class="market-brief-grid">
+          <div class="market-brief-card">
+            <div class="market-brief-title">Macro Headlines</div>
+            <div class="market-brief-headlines">${renderBriefHeadlines(brief?.macro_headlines || [])}</div>
+          </div>
+          <div class="market-brief-card">
+            <div class="market-brief-title">Premarket Setup</div>
+            <div class="market-brief-summary">${escapeHtml(premarket.summary || "Waiting for premarket setup...")}</div>
+            ${renderAnalysisParagraphs(premarket.analysis_details || "")}
+            <div class="detail-heading">Premarket Leaders</div>
+            <div class="market-brief-movers">${renderBriefMovers(premarket.top_movers || [])}</div>
+            <div class="detail-heading">Premarket Headlines</div>
+            <div class="market-brief-headlines">${renderBriefHeadlines(premarket.headlines || [])}</div>
+          </div>
+        </div>
+        ${sectors.map((section) => `
+          <div class="market-brief-card">
+            <div class="market-brief-title">${escapeHtml(section.title || "Sector")}</div>
+            <div class="market-brief-meta">
+              <span class="market-brief-pill">Importance: ${escapeHtml(section.importance || "-")}</span>
+              <span class="market-brief-pill">Symbols: ${escapeHtml(section.symbol_count || 0)}</span>
+            </div>
+            <div class="market-brief-summary">${escapeHtml(section.summary || "")}</div>
+            ${renderAnalysisParagraphs(section.analysis_details || "")}
+            <div class="market-brief-grid">
+              <div>
+                <div class="detail-heading">Top Movers</div>
+                <div class="market-brief-movers">${renderBriefMovers(section.top_movers || [])}</div>
+              </div>
+              <div>
+                <div class="detail-heading">Sector Headlines</div>
+                <div class="market-brief-headlines">${renderBriefHeadlines(section.headlines || [])}</div>
+              </div>
+            </div>
+          </div>
+        `).join("")}
+      `;
+    }
+
+    function renderRows(rows, board) {
+      if (!rows || !rows.length) {
+        const emptyText = board?.kind === "watchlist"
+          ? "No current names were returned for this TradingView watchlist."
+          : "No current premarket names matched the scan filters.";
+        tableBody.innerHTML = `<tr><td class="empty" colspan="9">${escapeHtml(emptyText)}</td></tr>`;
+        return;
+      }
+
+      tableBody.innerHTML = rows.map((row, index) => {
+        const movePercent = rowMovePercent(row);
+        const moveVolume = rowMoveVolume(row);
+        const positiveClass = movePercent >= 0 ? "positive" : "negative";
+        const categoryClass = slugifyCategory(row.category);
+        const detailId = `detail-${index}`;
+        return `
+          <tr class="main-row" data-detail-id="${detailId}">
+            <td>
+              <div class="ticker-wrap">
+                <span class="ticker-main">${escapeHtml(row.ticker)}</span>
+                <span class="ticker-sub">${escapeHtml((row.company_name || "") + " · " + rowMoveLabel(row))}</span>
+              </div>
+            </td>
+            <td><span class="${positiveClass}">${escapeHtml(formatPercent(movePercent))}</span></td>
+            <td>${escapeHtml(formatVolume(moveVolume))}</td>
+            <td>${escapeHtml(row.float_display || "-")}</td>
+            <td>${escapeHtml(row.short_display || "-")}</td>
+            <td><span class="pill ${categoryClass}">${escapeHtml(row.category || "No Fresh News")}</span></td>
+            <td><span class="pill ${gradeClass(row.grade)}">${escapeHtml(row.grade || "D")}</span></td>
+            <td><div class="reasoning">${escapeHtml(row.reasoning || "")}</div></td>
+            <td class="action-cell">
+              <a class="row-button" href="${escapeHtml(row.chart_url || "#")}" target="_blank" rel="noreferrer" data-stop-row-toggle="true">
+                Launch Multi-Chart
+              </a>
+            </td>
+          </tr>
+          <tr class="detail-row" id="${detailId}">
+            <td colspan="9">
+              <div class="detail-shell">
+                <div class="detail-block">
+                  <div class="detail-heading">Full AI Analysis</div>
+                  ${renderAnalysisParagraphs(row.analysis_details || "")}
+                </div>
+                <div class="detail-block">
+                  <div class="detail-heading">Latest Headlines</div>
+                  <div class="headline-list">${renderHeadlineList(row.news_items || [])}</div>
+                </div>
+              </div>
+            </td>
+          </tr>
+        `;
+      }).join("");
+
+      tableBody.querySelectorAll("tr.main-row").forEach((rowElement) => {
+        rowElement.addEventListener("click", (event) => {
+          if (event.target.closest("[data-stop-row-toggle='true']")) return;
+          const detailRow = document.getElementById(rowElement.dataset.detailId);
+          if (detailRow) detailRow.classList.toggle("open");
+        });
+      });
+    }
+
+    function updateBoardChrome(board, summary) {
+      if (board?.kind === "market-brief") {
+        summaryCountLabel.textContent = "Sectors";
+        summaryCountNote.textContent = "Watchlist sectors summarized in the current brief.";
+        summarySecondLabel.textContent = "Macro News";
+        summarySecondNote.textContent = "High-impact market headlines pulled into the brief.";
+        summaryAvgLabel.textContent = "Symbols Covered";
+        summaryAvgNote.textContent = "Total watchlist names included in the sector synthesis.";
+        summaryBestLabel.textContent = "Priority Sector";
+        summaryBestNote.textContent = "The sector the brief flags as most important right now.";
+        tableTitle.textContent = "Market Brief";
+        tableNote.textContent = "Macro context, premarket setup, and sector-by-sector news synthesis across your watchlists.";
+        moveHeader.textContent = "Move %";
+        footerLeft.textContent = "Market brief reuses the same watchlist states, merged headlines, and AI stack as the rest of the dashboard.";
+        footerRight.textContent = "Scheduled scans can precompute this brief at 8:30 AM and 8:30 PM Singapore time.";
+        summaryAGrades.textContent = summary?.macro_headline_count ?? "-";
+        summaryBestSetup.textContent = summary?.priority_sector || "-";
+        return;
+      }
+
+      if (board?.kind === "watchlist") {
+        summaryCountLabel.textContent = "Symbols";
+        summaryCountNote.textContent = `${board.symbol_count || 0} names in this shared TradingView watchlist.`;
+        summarySecondLabel.textContent = "Up Names";
+        summarySecondNote.textContent = "Names green on the selected move lens.";
+        summaryAvgLabel.textContent = "Average Move %";
+        summaryAvgNote.textContent = "Average selected move across this watchlist.";
+        summaryBestLabel.textContent = "Top Mover";
+        summaryBestNote.textContent = "Largest absolute move in this watchlist today.";
+        tableTitle.textContent = board.title || "Watchlist Board";
+        tableNote.textContent = "Fetches merged Yahoo Finance and Finviz headlines for each ticker and explains what happened to the stock on the day.";
+        moveHeader.textContent = "Move %";
+        footerLeft.textContent = `TradingView watchlist: ${board.title}`;
+        footerRight.textContent = "The move lens uses day move by default and flips to premarket when premarket action is clearly leading.";
+        summaryAGrades.textContent = summary?.up_count ?? "-";
+        summaryBestSetup.textContent = summary?.top_mover || "-";
+        return;
+      }
+
+      summaryCountLabel.textContent = "Symbols";
+      summaryCountNote.textContent = "Matching TradingView premarket gap names above {{ min_premarket_pct }}%.";
+      summarySecondLabel.textContent = "A Grades";
+      summarySecondNote.textContent = "Highest-confidence catalyst setups ranked by AI.";
+      summaryAvgLabel.textContent = "Average Premkt %";
+      summaryAvgNote.textContent = "Scanner threshold: {{ min_premarket_volume | int }} shares minimum premarket volume.";
+      summaryBestLabel.textContent = "Best Setup";
+      summaryBestNote.textContent = "Top-ranked name after catalyst and liquidity scoring.";
+      tableTitle.textContent = "Live Premarket Board";
+      tableNote.textContent = "Click any row for the full 3-4 paragraph AI breakdown and the latest merged headlines.";
+      moveHeader.textContent = "Premkt %";
+      footerLeft.textContent = "TradingView scan uses positive premarket movers only.";
+      footerRight.textContent = "News is merged from Yahoo Finance and the maintained lit26 Finviz fork. ib_chart opens on `tf=D` by default.";
+      summaryAGrades.textContent = summary?.a_count ?? "-";
+      summaryBestSetup.textContent = summary?.best_setup || "-";
+    }
+
+    function updateSummary(summary, board) {
+      updateBoardChrome(board, summary);
+      if (board?.kind === "market-brief") {
+        summaryCount.textContent = summary?.count ?? "-";
+        summaryAvgGap.textContent = summary?.symbols_covered ?? "-";
+      } else {
+        summaryCount.textContent = summary?.count ?? "-";
+        summaryAvgGap.textContent = summary?.avg_gap !== undefined ? `${Number(summary.avg_gap).toFixed(1)}%` : "-";
+      }
+
+      const geminiRows = Number(summary?.gemini_rows || 0);
+      const openrouterRows = Number(summary?.openrouter_rows || 0);
+      const openaiRows = Number(summary?.openai_rows || 0);
+      const anthropicRows = Number(summary?.anthropic_rows || 0);
+      const fallbackRows = Number(summary?.fallback_rows || 0);
+      const liveParts = [];
+      if (geminiRows > 0) liveParts.push(`Gemini ${geminiRows}`);
+      if (openrouterRows > 0) liveParts.push(`OpenRouter ${openrouterRows}`);
+      if (openaiRows > 0) liveParts.push(`OpenAI ${openaiRows}`);
+      if (anthropicRows > 0) liveParts.push(`Anthropic ${anthropicRows}`);
+
+      if (liveParts.length > 0 && fallbackRows === 0) {
+        aiModeChip.textContent = `AI: ${liveParts.join(" / ")}`;
+      } else if (liveParts.length > 0 && fallbackRows > 0) {
+        aiModeChip.textContent = `AI: ${liveParts.join(" / ")} / Fallback ${fallbackRows}`;
+      } else if (fallbackRows > 0) {
+        aiModeChip.textContent = `AI: Fallback ${fallbackRows}`;
+      } else {
+        aiModeChip.textContent = "AI: waiting";
+      }
+
+      if (summary?.global_chart_url) {
+        globalChartButton.href = summary.global_chart_url;
+        globalChartButton.classList.remove("disabled");
+      } else {
+        globalChartButton.href = "#";
+        globalChartButton.classList.add("disabled");
+      }
+    }
+
+    function updateStatus(payload) {
+      boardCache[payload.board?.id || selectedBoardId] = payload;
+      latestPayload = payload;
+      const board = payload.board || boardById(selectedBoardId);
+      const scanInProgress = Boolean(payload.scan_in_progress);
+      const lastError = payload.last_error || "";
+
+      renderBoardTabs(payload.boards || INITIAL_BOARDS);
+      statusDot.className = "status-dot";
+      if (lastError) {
+        statusDot.classList.add("error");
+      } else if (scanInProgress) {
+        statusDot.classList.add("scanning");
+      }
+
+      statusTitle.textContent = payload.status_text || (scanInProgress ? "Scanning..." : "Idle");
+      const meta = [];
+      if (board?.title) meta.push(`Board: ${board.title}`);
+      if (scanInProgress) meta.push(`Progress: ${payload.progress_done || 0}/${payload.progress_total || 0}`);
+      if (payload.scan_duration_seconds) meta.push(`Duration: ${payload.scan_duration_seconds}s`);
+      if (payload.last_exported_epoch) meta.push(`Obsidian synced ${relativeExportText(payload.last_exported_epoch)}`);
+      if (payload.last_export_error) meta.push(`Obsidian export: ${payload.last_export_error}`);
+      if (payload.next_scheduled_local_label) meta.push(`Next scheduled ${payload.next_scheduled_local_label}`);
+      if (lastError) meta.push(`Error: ${lastError}`);
+      statusMeta.textContent = meta.join(" | ") || "Ready.";
+
+      lastScanChip.textContent = relativeLastScanText(payload.scan_completed_epoch);
+      scheduleChip.textContent = `Schedule: ${payload.scheduled_times_label || "Disabled"}`;
+      refreshButton.disabled = scanInProgress;
+      updateSummary(payload.summary || {}, board);
+      if (board?.kind === "market-brief") {
+        dataTable.style.display = "none";
+        marketBriefShell.style.display = "grid";
+        renderMarketBrief(payload.market_brief || {});
+      } else {
+        marketBriefShell.style.display = "none";
+        dataTable.style.display = "table";
+        renderRows(payload.rows || [], board);
+      }
+    }
+
+    async function fetchStatus(boardId = selectedBoardId) {
+      const response = await fetch(`/api/status?board_id=${encodeURIComponent(boardId)}`);
+      const payload = await response.json();
+      if (boardId === selectedBoardId) updateStatus(payload);
+      return payload;
+    }
+
+    async function triggerScan(boardId = selectedBoardId, force = true, origin = "manual") {
+      refreshButton.disabled = true;
+      const response = await fetch(`/api/scan?board_id=${encodeURIComponent(boardId)}&force=${force ? "1" : "0"}&origin=${encodeURIComponent(origin)}`, { method: "POST" });
+      const payload = await response.json();
+      if (boardId === selectedBoardId) updateStatus(payload);
+      return payload;
+    }
+
+    async function ensureBoardLoaded(boardId, forceScan = false, origin = "view") {
+      const cached = boardCache[boardId];
+      if (cached && !forceScan) {
+        if (boardId === selectedBoardId) updateStatus(cached);
+        return cached;
+      }
+
+      const statusPayload = await fetchStatus(boardId);
+      if (forceScan || !statusPayload.scan_completed_epoch) {
+        return triggerScan(boardId, true, origin);
+      }
+      if (boardId === selectedBoardId) updateStatus(statusPayload);
+      return statusPayload;
+    }
+
+    refreshButton.addEventListener("click", () => {
+      refreshCountdown = AUTO_REFRESH_SECONDS;
+      triggerScan(selectedBoardId, true, "manual").catch((error) => {
+        statusTitle.textContent = "Failed to trigger scan";
+        statusMeta.textContent = String(error);
+      });
+    });
+
+    setInterval(() => {
+      refreshCountdown = Math.max(0, refreshCountdown - 1);
+      nextRefreshChip.textContent = `Next refresh: ${refreshCountdown}s`;
+      if (latestPayload) {
+        lastScanChip.textContent = relativeLastScanText(latestPayload.scan_completed_epoch);
+      }
+      if (refreshCountdown === 0) {
+        refreshCountdown = AUTO_REFRESH_SECONDS;
+        const activeBoard = boardById(selectedBoardId);
+        if (activeBoard?.kind === "market-brief") {
+          fetchStatus(selectedBoardId).catch(() => {});
+        } else {
+          triggerScan(selectedBoardId, true, "auto").catch(() => {});
+        }
+      }
+    }, 1000);
+
+    setInterval(() => {
+      fetchStatus(selectedBoardId).catch(() => {});
+    }, 2500);
+
+    renderBoardTabs(INITIAL_BOARDS);
+    ensureBoardLoaded(selectedBoardId, true, "view").catch(() => triggerScan(selectedBoardId, true, "view"));
+  </script>
+</body>
+</html>
+"""
+)
 
 
 if __name__ == "__main__":
-    main()
+    app.run(
+        host=os.getenv("APP_HOST", "127.0.0.1"),
+        port=int(os.getenv("APP_PORT", "5000")),
+        debug=os.getenv("FLASK_DEBUG", "1").lower() in {"1", "true", "yes", "on"},
+    )
