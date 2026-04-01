@@ -1,16 +1,7 @@
-# Secrets — never commit these
 .env
-*.env
-.streamlit/secrets.toml
-run.bat
-
-# App data
-watchlist.json
 __pycache__/
 *.pyc
 *.pyo
-.pytest_cache/
-
-# OS
+*.log
 .DS_Store
 Thumbs.db
